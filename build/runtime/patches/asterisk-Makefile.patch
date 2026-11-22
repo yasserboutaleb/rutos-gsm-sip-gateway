@@ -1,0 +1,36 @@
+Reduced Asterisk for the rut360gw embedded runtime (build/runtime/build.sh):
+- without OpenSSL (--without-ssl --without-crypto): TLS and SRTP, when needed, are handled by the
+  SIP server side; the router talks plain SIP/RTP inside the WireGuard tunnel; res_crypto (which
+  requires OpenSSL) is removed from the modules built into the asterisk package;
+- without SRTP (--without-srtp; res_srtp is not loaded).
+libxml2 is still required by configure (menuselect): the runtime replaces it with a stub.
+
+--- a/Makefile
++++ b/Makefile
+@@ -516,7 +516,7 @@
+ AST_EMB_MODULES:=\
+ 	app_dial app_echo app_macro app_playback \
+ 	func_callerid func_logic func_strings func_timeout \
+-	pbx_config res_crypto res_timing_timerfd
++	pbx_config res_timing_timerfd
+ 
+ define Package/$(PKG_NAME)/install
+ $(call Package/$(PKG_NAME)/install/lib,$(1),libasteriskssl)
+@@ -587,7 +587,7 @@
+ 	--without-nbs \
+ 	--without-pjproject-bundled \
+ 	--with-libedit="$(STAGING_DIR)/usr" \
+-	--with-libxml2 \
++	--with-libxml2 --without-ssl --without-crypto \
+ 	$(if $(CONFIG_ASTERISK_LIBXSLT_SUPPORT),--with-libxslt,--without-libxslt) \
+ 	$(if $(CONFIG_PACKAGE_$(PKG_NAME)-res-snmp),--with-netsnmp="$(STAGING_DIR)/usr",--without-netsnmp) \
+ 	--without-newt \
+@@ -639,7 +639,7 @@
+ 	--without-srtp
+ else
+ CONFIGURE_ARGS+= \
+-	--with-srtp="$(STAGING_DIR)/usr"
++	--without-srtp
+ endif
+ 
+ ifeq ($(CONFIG_PACKAGE_$(PKG_NAME)-pjsip)$(CONFIG_PACKAGE_$(PKG_NAME)-res-pjproject)$(CONFIG_PACKAGE_$(PKG_NAME)-res-rtp-asterisk),)

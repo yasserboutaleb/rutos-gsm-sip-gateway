@@ -1,0 +1,22 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+chmod 600 /etc/config/rut360gw
+mkdir -p /etc/rut360gw && chmod 700 /etc/rut360gw
+# start at boot: the service does nothing while rut360gw.main.enabled=0
+/etc/init.d/rut360gw enable
+# web page API (/rut360gw/): rpcd reloads its plugins without closing WebUI sessions
+/etc/init.d/rpcd reload 2>/dev/null
+# Upgrade: opkg ran the prerm of the old version, which stops the service. Restart it
+# if the gateway is enabled (otherwise an upgrade through the RutOS WebUI would leave it stopped).
+# In the background: the WebUI Package Manager waits for opkg to finish before answering.
+rm -f /etc/config/rut360gw-opkg   # new default config dropped by opkg: the current settings are kept
+# Upgrade from v0.1.1 or earlier: the vps section becomes the server section (ip mode). No
+# network change: a WireGuard tunnel created by an older version stays as is (managed by RutOS).
+for d in /usr/local/usr/sbin /usr/sbin; do
+	[ -x "$d/rut360gw-config" ] && { "$d/rut360gw-config" migrate || true; break; }
+done
+if [ -z "${RUT360GW_NO_RESTART:-}" ] && [ "$(uci -q get rut360gw.main.enabled)" = 1 ]; then   # deploy-ipk.sh restarts it itself
+	( sleep 3; /etc/init.d/rut360gw restart ) </dev/null >/dev/null 2>&1 &
+fi
+echo "rut360gw installed. Setup: http://<router>/rut360gw/ (router admin account), or /etc/config/rut360gw + rut360gw-config apply"
+exit 0

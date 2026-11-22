@@ -1,0 +1,108 @@
+#!/bin/sh
+# rut360gw-watchdog — safety net for the chan_quectel driver (procd instance "watchdog").
+#
+# The driver recovers by itself in the known cases (hangup refused, unknown call, voice to enable
+# again, AT+QPCMV? refused at initialisation). This safety net covers what would remain: device
+# missing from Asterisk's list, "Not initialized" that lasts, or a stuck Asterisk console (driver
+# lock left held: "Task skipping: no lock", seen with an EC25 modem). In these cases no call goes
+# through until Asterisk restarts, while the rest of the router is fine.
+#
+# Rule: one check per minute; if the device is in one of these states for 5 checks in a row
+# (no call can go through) and more than 3 min after Asterisk started, Asterisk is stopped and procd
+# restarts it (the rest of RutOS is left alone: no modem, data or mobifd action). At most 3 restarts
+# per 6 h period, then only an alert in the log (the self-test then reports the failed state).
+#
+#   rut360gw-watchdog           loop (started by /etc/init.d/rut360gw)
+#   rut360gw-watchdog check     one check: prints ok, or the faulty state; changes nothing
+#
+# Test settings (environment): RUT360GW_WD_INTERVAL (s), RUT360GW_WD_BAD (checks),
+# RUT360GW_WD_MAX (restarts per period), RUT360GW_WD_PERIOD (s), RUT360GW_CLI (console).
+
+P=; [ -x /usr/local/usr/sbin/rut360gw-config ] && P=/usr/local
+CLI=${RUT360GW_CLI:-$P/usr/sbin/rut360gw-cli}
+INTERVAL=${RUT360GW_WD_INTERVAL:-60}
+BAD_MAX=${RUT360GW_WD_BAD:-5}
+RESTART_MAX=${RUT360GW_WD_MAX:-3}
+PERIOD=${RUT360GW_WD_PERIOD:-21600}
+STATE=/var/run/rut360gw/watchdog.restarts
+DEV=eg06
+
+log() { logger -p "user.$1" -t rut360gw "$2"; }
+
+# Asterisk console with a timeout: if the driver lock is left held, the command never returns
+cli_t() {
+	out=/var/run/rut360gw/watchdog.$$
+	"$CLI" "$1" > "$out" 2>/dev/null &
+	cpid=$!
+	n=0
+	while kill -0 "$cpid" 2>/dev/null; do
+		n=$((n + 1))
+		if [ "$n" -gt 20 ]; then
+			kill -9 "$cpid" 2>/dev/null
+			rm -f "$out"
+			return 2
+		fi
+		sleep 1
+	done
+	cat "$out"
+	rm -f "$out"
+	return 0
+}
+
+# device state: ok, wait (nothing to judge yet), or the fault
+measure() {
+	pidof asterisk >/dev/null || { echo wait; return; }
+	up=$(cli_t "core show uptime seconds" | awk '/System uptime/{print $3}')
+	[ -n "$up" ] || { echo "Asterisk console silent"; return; }
+	[ "$up" -ge 180 ] 2>/dev/null || { echo wait; return; }
+	devs=$(cli_t "quectel show devices") || { echo "Asterisk console stuck (quectel show devices)"; return; }
+	st=$(echo "$devs" | awk -v d="$DEV" '$1==d{print $3, $4}')
+	case "$st" in
+		"") echo "device $DEV missing from Asterisk's list" ;;
+		"Not initialized"*) echo "device $DEV not initialized" ;;
+		*) calls=$(cli_t "core show channels count" | sed -n 's/^\([0-9]*\) active call.*/\1/p')
+		   [ -n "$calls" ] || { echo "Asterisk console stuck (core show channels)"; return; }
+		   echo ok ;;
+	esac
+}
+
+# restarts already done in the current period (timestamps, one line per restart)
+recent_restarts() {
+	now=$(date +%s)
+	[ -f "$STATE" ] || { echo 0; return; }
+	awk -v now="$now" -v p="$PERIOD" '$1 > now - p' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+	wc -l < "$STATE" | tr -d ' '
+}
+
+restart_asterisk() {
+	pid=$(pidof asterisk) || return
+	date +%s >> "$STATE"
+	kill "$pid" 2>/dev/null
+	n=0
+	while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 15 ]; do sleep 1; n=$((n + 1)); done
+	kill -9 "$pid" 2>/dev/null
+}
+
+mkdir -p /var/run/rut360gw
+if [ "${1:-}" = check ]; then
+	measure
+	exit 0
+fi
+
+bad=0; alerted=0
+while sleep "$INTERVAL"; do
+	m=$(measure)
+	case "$m" in
+		ok|wait) bad=0; alerted=0; continue ;;
+	esac
+	bad=$((bad + 1))
+	[ "$bad" -ge "$BAD_MAX" ] || continue
+	if [ "$(recent_restarts)" -ge "$RESTART_MAX" ]; then
+		[ "$alerted" = 1 ] || log err "safety net: $m for $bad min, but already $RESTART_MAX Asterisk restarts in $((PERIOD / 3600)) h: no more automatic restart (rut360gw-check, then /etc/init.d/rut360gw restart)"
+		alerted=1
+		continue
+	fi
+	log warn "safety net: $m for $bad min, no call possible: restarting Asterisk (procd)"
+	restart_asterisk
+	bad=0
+done

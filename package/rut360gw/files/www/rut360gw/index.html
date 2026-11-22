@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GSM Gateway</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="topbar" class="hidden">
+	<h1>GSM Gateway <small id="version"></small></h1>
+	<button class="secondary" id="logout">Sign out</button>
+</header>
+
+<section id="login" class="card">
+	<h2>GSM Gateway — sign in</h2>
+	<p class="muted">Use the router web interface account (administrator).</p>
+	<form id="loginForm">
+		<label for="user">Username</label><input id="user" value="admin" autocomplete="username">
+		<label for="pass">Password</label><input id="pass" type="password" autocomplete="current-password">
+		<div class="actions"><button class="primary" type="submit">Sign in</button></div>
+		<div class="msg" id="loginMsg"></div>
+	</form>
+</section>
+
+<main id="app" class="hidden">
+	<nav>
+		<button data-tab="dashboard" class="active">Dashboard</button>
+		<button data-tab="sms">SMS</button>
+		<button data-tab="ussd">USSD</button>
+		<button data-tab="setup">Setup</button>
+		<button data-tab="settings">Settings</button>
+		<button data-tab="logs">Logs</button>
+	</nav>
+
+	<!-- ============================================================ Dashboard -->
+	<section id="tab-dashboard" class="card">
+		<h2>Gateway status</h2>
+		<div class="grid" id="tiles"></div>
+		<div id="cuBox" class="warnbox hidden">
+			<strong>RutOS settings get in the way of the gateway.</strong>
+			<p class="small" id="cuText"></p>
+			<button class="primary" id="fixCU">Fix RutOS settings</button>
+		</div>
+		<div class="actions">
+			<button class="secondary" id="refresh">Refresh</button>
+			<button class="secondary" id="restart">Restart gateway</button>
+			<button class="secondary" id="selfTest">Self-test</button>
+		</div>
+		<p class="muted small">Refreshed every 30 s while this tab is open and visible. The self-test checks everything a call or an SMS depends on (read-only, about 10 s).</p>
+		<div class="msg" id="statusMsg"></div>
+		<pre class="logs hidden" id="selfTestOut"></pre>
+	</section>
+
+	<!-- ============================================================ SMS -->
+	<section id="tab-sms" class="hidden">
+		<div class="card">
+			<h2>SIM storage</h2>
+			<div class="bar"><div id="simBar"></div></div>
+			<p id="simText" class="muted"></p>
+			<p id="purgeText" class="small"></p>
+			<p id="emailText" class="small"></p>
+			<div class="msg" id="emailWarn"></div>
+		</div>
+		<div class="card">
+			<h2>Messages on the SIM</h2>
+			<div id="smsList"></div>
+			<div class="actions">
+				<button class="secondary" id="smsRefresh">Refresh</button>
+				<button class="danger" id="smsClear">Delete all from SIM</button>
+			</div>
+			<div class="msg" id="smsMsg"></div>
+		</div>
+	</section>
+
+	<!-- ============================================================ USSD -->
+	<section id="tab-ussd" class="card hidden">
+		<h2>USSD session</h2>
+		<p class="muted small">Send a code such as <code>*600#</code>, then answer the operator menus (<code>0</code>, <code>6</code>, <code>00</code>…).
+			Refused during a GSM call. On some networks a USSD request interrupts mobile data for up to a minute.</p>
+		<div id="ussdLog" class="chat"></div>
+		<p id="ussdState" class="small muted"></p>
+		<form id="ussdForm" class="row">
+			<div class="grow3"><label for="ussdInput">Code or answer</label><input id="ussdInput" inputmode="tel" autocomplete="off" placeholder="*600#  or  0  or  00" spellcheck="false"></div>
+			<div class="grow1 bottom"><button class="primary wide" type="submit" id="ussdSend">Send</button></div>
+		</form>
+		<div class="actions">
+			<button class="secondary" id="ussdClear" title="Closes the USSD session with the operator and erases all the exchanges shown here">Clear session</button>
+			<button class="secondary" id="ussdRefresh">Refresh</button>
+		</div>
+		<div class="msg" id="ussdMsg"></div>
+	</section>
+
+	<!-- ============================================================ Setup -->
+	<section id="tab-setup" class="card hidden">
+		<h2>Setup</h2>
+		<p class="small muted">The gateway can work with a remote SIP server (Asterisk, FreePBX…), with a softphone on the LAN (Settings tab), or both. If the server is reached through a VPN, set the VPN up in RutOS (Services › VPN); the gateway does not create tunnels.</p>
+		<label class="check"><input type="checkbox" id="s_on"> Use a remote SIP server</label>
+		<div id="srvBox">
+			<label for="s_mode">Connection</label>
+			<select id="s_mode">
+				<option value="register">Register with a username and password (recommended, works behind NAT)</option>
+				<option value="ip">Trusted peer over a VPN, identified by its address (no password)</option>
+			</select>
+			<div class="row">
+				<div class="grow3"><label for="s_host">Server address <small id="s_host_hint">(host name or IP)</small></label><input id="s_host" placeholder="e.g. pbx.example.com" spellcheck="false"></div>
+				<div class="grow1"><label for="s_port">SIP port <small>(UDP)</small></label><input id="s_port" inputmode="numeric" value="5060"></div>
+			</div>
+			<div class="row" id="regRow">
+				<div><label for="s_user">Username <small>(the gateway's account on the server)</small></label><input id="s_user" autocomplete="off" spellcheck="false"></div>
+				<div><label for="s_pass">Password</label><input id="s_pass" type="password" autocomplete="new-password" spellcheck="false"></div>
+			</div>
+			<div class="actions" id="regActions"><button class="secondary" id="showSpass">Show</button></div>
+			<div class="row">
+				<div><label for="s_ext">Extension that receives GSM calls and SMS <small>(on the server)</small></label><input id="s_ext" spellcheck="false" placeholder="e.g. 101"></div>
+				<div id="addrBox"><label for="s_addr">Gateway address in the VPN</label><input id="s_addr" placeholder="e.g. 10.8.0.2" spellcheck="false"></div>
+			</div>
+		</div>
+		<label for="s_gsmin">Incoming GSM calls ring</label>
+		<select id="s_gsmin">
+			<option value="auto">The SIP server if it is used, otherwise the LAN softphone</option>
+			<option value="server">The SIP server only</option>
+			<option value="local">The LAN softphone only</option>
+			<option value="both">Both at the same time (the first to answer takes the call)</option>
+		</select>
+		<label for="s_country">Country (call tones)</label><select id="s_country"></select>
+		<div class="actions"><button class="primary" id="saveSetup">Save and activate</button></div>
+		<div class="msg" id="setupMsg"></div>
+		<details class="mt10"><summary>What to configure on the SIP server</summary>
+			<dl class="kv mt10" id="srvHelp"></dl>
+		</details>
+	</section>
+
+	<!-- ============================================================ Settings -->
+	<section id="tab-settings" class="hidden">
+		<div class="card">
+			<h2>Gateway</h2>
+			<label class="check"><input type="checkbox" id="c_enabled"> Gateway enabled</label>
+			<label class="check"><input type="checkbox" id="c_rutos"> Manage the RutOS settings the gateway needs (Call Utilities, e-mail forwarding); original values are restored on uninstall</label>
+			<label for="c_country">Country (call tones)</label><select id="c_country"></select>
+			<h3>Features</h3>
+			<label class="check"><input type="checkbox" id="c_sms"> SMS bridge (SMS ↔ SIP messages)</label>
+			<label class="check"><input type="checkbox" id="c_purge"> Delete relayed SMS from the SIM</label>
+			<label for="c_purge_delay">…after <small>(seconds, 60 to 86400; leaves time for RutOS e-mail forwarding)</small></label>
+			<input id="c_purge_delay" inputmode="numeric">
+			<label class="check"><input type="checkbox" id="c_ussd"> USSD (*codes dialled from a softphone, and the USSD tab)</label>
+			<label for="c_ringback">Ringback tone on outgoing calls</label>
+			<select id="c_ringback">
+				<option value="network">From the network, like a phone (keeps operator announcements; silent with VoLTE)</option>
+				<option value="local">Generated by the gateway from dialing (heard with VoLTE too, but no operator announcements)</option>
+			</select>
+		</div>
+
+		<div class="card">
+			<h2>LAN SIP client <small class="muted">(optional, e.g. a softphone in the office)</small></h2>
+			<div class="row">
+				<div><label for="c_luser">Username</label><input id="c_luser" autocomplete="off" spellcheck="false"></div>
+				<div><label for="c_lpass">Password <small id="c_lpass_hint"></small></label><input id="c_lpass" type="password" autocomplete="new-password" spellcheck="false"></div>
+			</div>
+			<div class="actions">
+				<button class="secondary" id="showLpass">Show</button>
+				<button class="secondary" id="regenLocal">Generate new password</button>
+			</div>
+			<label class="check"><input type="checkbox" id="c_ldisable"> Disable the LAN SIP client</label>
+			<dl class="kv mt10" id="lanInfo"></dl>
+		</div>
+		<div class="actions sticky"><button class="primary" id="save">Save and apply</button></div>
+		<div class="msg" id="saveMsg"></div>
+	</section>
+
+
+	<!-- ============================================================ Logs -->
+	<section id="tab-logs" class="card hidden">
+		<h2>Events <small class="muted">(newest first, from the RutOS system log kept in RAM: cleared at reboot)</small></h2>
+		<div class="actions mt0 mb12" id="evFilters">
+			<button class="secondary small active" data-kind="">All</button>
+			<button class="secondary small" data-kind="call">Calls</button>
+			<button class="secondary small" data-kind="sms">SMS</button>
+			<button class="secondary small" data-kind="ussd">USSD</button>
+			<button class="secondary small" data-kind="system">Gateway</button>
+			<button class="secondary small" data-kind="problem">Problems</button>
+		</div>
+		<div id="events" class="events"></div>
+		<div class="actions">
+			<button class="secondary" id="refreshLogs">Refresh</button>
+			<button class="secondary" id="rawToggle">Show raw log</button>
+		</div>
+		<pre class="logs hidden" id="logs"></pre>
+	</section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

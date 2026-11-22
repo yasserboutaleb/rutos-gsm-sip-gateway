@@ -1,0 +1,82 @@
+#!/bin/sh
+# rut360gw-fw — RutOS firewall rules (fw3, UCI firewall) of the gateway, LAN side:
+#   - SIP rate limit: at most features.lan_sip_limit SIP packets (UDP 5060) per second
+#     from the LAN, the rest is dropped (password guessing, runaway client).
+#     0 = no limit;
+#   - anti-spoofing, in ip mode only: the trusted SIP server is identified by its address,
+#     without a password; a packet coming from the LAN with that source address is dropped
+#     (otherwise a LAN device could impersonate the server and place calls).
+#
+#   rut360gw-fw apply    adds or updates the rules if they differ from the expected ones, then reloads
+#                        the firewall (only when something changed); run at service start
+#   rut360gw-fw remove   removes the rules (package removal)
+#   rut360gw-fw show     expected rules and rules in place
+#
+# Rules: firewall.rut360gw_antispoof, firewall.rut360gw_sip_lan, firewall.rut360gw_sip_lan_drop,
+# in that order. Nothing else is touched. RUT360GW_FW_NORELOAD=1: no reload (test bench).
+
+P=; [ -x /usr/local/usr/sbin/rut360gw-config ] && P=/usr/local
+log() { logger -t rut360gw-fw "$*"; echo "rut360gw-fw: $*" >&2; }
+get() { v=$(uci -q get "rut360gw.$1"); [ -n "$v" ] && echo "$v" || echo "$2"; }
+RULES="rut360gw_antispoof rut360gw_sip_lan rut360gw_sip_lan_drop"
+
+# expected state, one line per option ("section.option=value"), in creation order
+want() {
+	if uci -q get rut360gw.server >/dev/null; then
+		on=$(get server.enabled 0); mode=$(get server.mode register); host=$(get server.host "")
+	else # legacy vps section (up to v0.1.1): ip mode
+		on=$(get vps.enabled 1); mode=ip; host=$(get vps.peer_address "")
+	fi
+	if [ "$on" = 1 ] && [ "$mode" = ip ] && echo "$host" | grep -q -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+		printf '%s\n' "rut360gw_antispoof=rule" "rut360gw_antispoof.name=rut360gw: SIP server address from the LAN" \
+			"rut360gw_antispoof.src=lan" "rut360gw_antispoof.family=ipv4" "rut360gw_antispoof.proto=all" \
+			"rut360gw_antispoof.src_ip=$host" "rut360gw_antispoof.target=DROP"
+	fi
+	lim=$(get features.lan_sip_limit 20)
+	if [ "$lim" != 0 ]; then
+		printf '%s\n' "rut360gw_sip_lan=rule" "rut360gw_sip_lan.name=rut360gw: SIP from the LAN, rate limit" \
+			"rut360gw_sip_lan.src=lan" "rut360gw_sip_lan.proto=udp" "rut360gw_sip_lan.dest_port=5060" \
+			"rut360gw_sip_lan.limit=$lim/sec" "rut360gw_sip_lan.limit_burst=$((lim * 2))" "rut360gw_sip_lan.target=ACCEPT" \
+			"rut360gw_sip_lan_drop=rule" "rut360gw_sip_lan_drop.name=rut360gw: SIP from the LAN, over the limit" \
+			"rut360gw_sip_lan_drop.src=lan" "rut360gw_sip_lan_drop.proto=udp" "rut360gw_sip_lan_drop.dest_port=5060" \
+			"rut360gw_sip_lan_drop.target=DROP"
+	fi
+}
+
+# current state, same format
+have() {
+	for r in $RULES; do
+		uci -q get "firewall.$r" >/dev/null || continue
+		echo "$r=$(uci -q get "firewall.$r")"
+		for o in name src family proto src_ip dest_port limit limit_burst target; do
+			v=$(uci -q get "firewall.$r.$o") && echo "$r.$o=$v"
+		done
+	done
+}
+
+remove_rules() { for r in $RULES; do uci -q delete "firewall.$r"; done; }
+
+reload_fw() {
+	uci commit firewall
+	[ -n "${RUT360GW_FW_NORELOAD:-}" ] || /etc/init.d/firewall reload >/dev/null 2>&1
+}
+
+case "${1:-}" in
+	apply)
+		uci -q get firewall.@zone[0] >/dev/null || { log "no firewall configuration: nothing to do"; exit 0; }
+		uci show firewall | grep -q "\.name='lan'" || { log "lan zone missing: rules not added"; exit 0; }
+		w=$(want); h=$(have)
+		[ "$w" = "$h" ] && exit 0
+		remove_rules
+		echo "$w" | while IFS= read -r l; do [ -n "$l" ] && uci set "firewall.$l"; done
+		reload_fw
+		log "LAN rules updated: $(echo "$w" | grep -c '=rule$') rule(s) ($(echo "$w" | grep -q antispoof && echo 'server anti-spoofing, ')SIP limit $(get features.lan_sip_limit 20)/s)"
+		;;
+	remove)
+		[ -n "$(have)" ] || exit 0
+		remove_rules; reload_fw
+		log "LAN rules removed"
+		;;
+	show) echo "== expected"; want; echo "== in place"; have ;;
+	*) echo "usage: $0 apply|remove|show" >&2; exit 2 ;;
+esac

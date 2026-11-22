@@ -1,0 +1,141 @@
+#!/bin/sh
+# rut360gw-check — self-test of the gateway on the router: checks everything a call or an SMS
+# depends on, and gives a verdict. Read-only: changes nothing, places no call and sends no SMS.
+# The messages are also shown in the web page (Dashboard > Self-test).
+#
+#   rut360gw-check          one OK / WARN / FAIL line per check, then the verdict
+#   rut360gw-check -q       verdict only
+# Exit code: 0 = self-test passed (WARN lines possible), 1 = at least one FAIL.
+#
+# In the first minutes after a boot, the runtime may still be downloading and the trunk qualifying:
+# a FAIL at that time is not abnormal; run the self-test again 2 to 3 minutes later.
+
+P=; [ -x /usr/local/usr/sbin/rut360gw-config ] && P=/usr/local
+CLI=$P/usr/sbin/rut360gw-cli
+QUIET=0; [ "${1:-}" = -q ] && QUIET=1
+ko=0; warn=0
+
+line() { [ "$QUIET" = 1 ] || printf '%-4s  %s: %s\n' "$1" "$2" "$3"; }
+ok()   { line OK "$1" "$2"; }
+att()  { warn=$((warn + 1)); line WARN "$1" "$2"; }
+bad()  { ko=$((ko + 1)); line FAIL "$1" "$2"; }
+check() { # $1=condition (1 = good) $2=label $3=detail $4=severity if false (bad by default, or att)
+	if [ "$1" = 1 ]; then ok "$2" "$3"; else "${4:-bad}" "$2" "$3"; fi
+}
+b() { eval "$*" && echo 1 || echo 0; }
+
+S=$(ubus call rut360gw status 2>/dev/null)
+j() { echo "$S" | jsonfilter -e "@.$1" 2>/dev/null; }
+
+# --- package and service
+ver=$(j version)
+check "$(b '[ -n "$ver" ]')" "package / API" "${ver:-rpcd API rut360gw missing (rpcd not reloaded?)}"
+check "$(b 'ls /etc/rc.d/S*rut360gw >/dev/null 2>&1')" "start at boot" "$(ls /etc/rc.d/S*rut360gw >/dev/null 2>&1 && echo enabled || echo 'disabled: /etc/init.d/rut360gw enable')"
+check "$(b '[ "$(j enabled)" = true ]')" "gateway activated" "rut360gw.main.enabled=$(uci -q get rut360gw.main.enabled)"
+rt=$(j runtime)
+check "$(b '[ "$rt" = ready ]')" "runtime (RAM)" "${rt:-?}$([ "$rt" = waiting_network ] && echo ': no mobile data yet, retried every 2 min')$([ "$rt" = low_memory ] && echo ': not enough free RAM, retried every 2 min')"
+check "$(b '[ "$(j asterisk)" = true ]')" "Asterisk" "$(pidof asterisk >/dev/null && echo running || echo stopped)"
+check "$(b '$CLI "module show like chan_quectel" 2>/dev/null | grep -q Running')" "chan_quectel driver" "$($CLI "module show like chan_quectel" 2>/dev/null | grep -q Running && echo loaded || echo 'not loaded')"
+if [ "$(uci -q get rut360gw.features.sms_bridge)" != 0 ]; then
+	check "$(b '[ "$(j smsbridge)" = true ]')" "SMS bridge" "$([ "$(j smsbridge)" = true ] && echo running || echo stopped)"
+fi
+
+# --- modem and mobile network
+m=$(j modem)
+# right after Asterisk starts, chan_quectel initialises the modem (~30-60 s): warning only
+astup=$($CLI "core show uptime seconds" 2>/dev/null | awk '/System uptime/{print $3}')
+if [ "$m" = Free ] || [ "$(j calls)" -gt 0 ] 2>/dev/null; then ok "modem (gateway)" "$m"
+elif [ "${astup:-999}" -lt 120 ] 2>/dev/null; then att "modem (gateway)" "${m:-?}: initialising (Asterisk started ${astup} s ago), run the self-test again in a minute"
+elif [ "$m" = NoVoice ]; then bad "modem (gateway)" "voice not enabled on the modem: every call is refused. Retried every 5 s while no call is in progress; if it lasts: /etc/init.d/rut360gw restart"
+else bad "modem (gateway)" "${m:-?}"; fi
+check "$(b '[ "$(j data)" = Connected ]')" "mobile data" "$(j operator) $(j technology): $(j data)" att
+case "$(j volte)" in Active) ok "VoLTE" "active" ;; *) att "VoLTE" "$(j volte) (calls fall back to 3G/2G, data keeps working)" ;; esac
+
+# RutOS failover (mwan3, outside the package): without VoLTE, every call switches the modem to 3G and
+# stops mobile data for 10 to 15 s. If mwan3 then declares the mobile link down, the tunnel and the
+# call audio drop at every call whenever that link is the only one left (primary link down).
+# Seen in the field (several false outages per day). RutOS 7.14: interval on the interface,
+# failure count (down) on a condition attached to the interface; stock mwan3: on the interface.
+mw_down() { # $1 = interface: "down interval" if mwan3 tracks it, nothing otherwise
+	[ "$(uci -q get "mwan3.$1.enabled")" = 1 ] || return 0
+	mi=$(uci -q get "mwan3.$1.interval"); md=$(uci -q get "mwan3.$1.down")
+	if [ -z "$md" ]; then
+		mc=$(uci -q show mwan3 | sed -n "s/^mwan3\.\(@condition\[[0-9]*\]\)\.interface='$1'$/\1/p" | head -1)
+		[ -n "$mc" ] && md=$(uci -q get "mwan3.$mc.down")
+	fi
+	echo "${md:-3} ${mi:-5}"
+}
+if [ "$(j volte)" != Active ] && [ -f /etc/config/mwan3 ]; then
+	for ifc in $(uci -q show network | sed -n "s/^network\.\([^.]*\)\.proto='wwan'$/\1/p"); do
+		r=$(mw_down "$ifc"); [ -n "$r" ] || continue
+		md=${r% *}; mi=${r#* }
+		if [ $((md * mi)) -ge 30 ] 2>/dev/null; then
+			ok "mobile failover ($ifc)" "declared down after $md failed checks every $mi s ($((md * mi)) s): the switch to 3G of a call does not trip it"
+		else
+			att "mobile failover ($ifc)" "declared down after $md failed checks every $mi s ($((md * mi)) s), but each call without VoLTE stops mobile data 10-15 s: if $ifc is the only link left, the tunnel and the call audio drop at every call. Network > Failover: set Down to $(((30 + mi - 1) / mi))"
+		fi
+	done
+fi
+su=$(j sim_used); st=$(j sim_total)
+if [ "${st:-0}" -gt 0 ] 2>/dev/null; then
+	check "$(b '[ $((100 * su / st)) -lt 80 ]')" "SIM SMS storage" "$su / $st" att
+else
+	att "SIM SMS storage" "unreadable"
+fi
+
+# --- RutOS settings (Call Utilities, e-mail forwarding)
+check "$(b '[ "$(j incoming_blocked)" = false ]')" "incoming calls" "$([ "$(j incoming_blocked)" = true ] && echo "blocked by RutOS Call Utilities (action=$(j call_utils_action))" || echo 'left to the gateway')"
+iss=$($P/usr/sbin/rut360gw-rutos status 2>/dev/null | tr '\n' ' ')
+check "$(b '[ -z "$iss" ]')" "RutOS settings" "${iss:-aligned}"
+
+# --- remote SIP server (section server; otherwise the legacy vps section = ip mode inside the tunnel)
+if uci -q get rut360gw.server >/dev/null; then
+	srv_on=$(uci -q get rut360gw.server.enabled); srv_mode=$(uci -q get rut360gw.server.mode)
+	srv_host=$(uci -q get rut360gw.server.host)
+else
+	srv_on=$(uci -q get rut360gw.vps.enabled || echo 1); srv_mode=ip; srv_host=$(uci -q get rut360gw.vps.peer_address)
+fi
+tr=$(j trunk)
+if [ "${srv_on:-0}" = 1 ] && [ "$srv_mode" = register ]; then
+	reg=$($CLI "pjsip show registrations" 2>/dev/null | grep 'server-reg' | grep -o -E 'Unregistered|Registered|Rejected|Stopped' | head -1)
+	if [ "$reg" = Registered ]; then ok "SIP server registration" "registered on $srv_host"
+	elif [ "${astup:-999}" -lt 120 ] 2>/dev/null; then att "SIP server registration" "${reg:-?}: in progress (Asterisk started ${astup} s ago), run the self-test again in a minute"
+	else bad "SIP server registration" "${reg:-not registered} on $srv_host (address, port, username and password in page > Setup)"; fi
+	if echo "$tr" | grep -q ^Avail; then ok "SIP server" "$tr"
+	else att "SIP server" "${tr:-?}: not answering OPTIONS (some servers do not; calls still work while registered)"; fi
+elif [ "${srv_on:-0}" != 1 ]; then
+	if [ -n "$(uci -q get rut360gw.local.password)" ]; then ok "SIP server" "none: LAN SIP client only"
+	else bad "SIP server" "no remote SIP server and no LAN SIP client: nobody can take calls (page > Setup)"; fi
+fi
+
+# --- ip mode: trusted peer reached through a VPN (the one configured in RutOS)
+if [ "${srv_on:-0}" = 1 ] && [ "$srv_mode" = ip ]; then
+	check "$(b 'ping -c 2 -W 3 "$srv_host" >/dev/null 2>&1')" "SIP server reachable" "ping $srv_host (through the VPN)"
+	if echo "$tr" | grep -q ^Avail; then ok "SIP trunk (server)" "$tr"
+	elif [ "${astup:-999}" -lt 120 ] 2>/dev/null; then att "SIP trunk (server)" "${tr:-?}: being qualified (Asterisk started ${astup} s ago), run the self-test again in a minute"
+	else bad "SIP trunk (server)" "${tr:-no contact (Asterisk stopped?)}"; fi
+fi
+
+# --- resources
+ram=$(j ram_free_mb)
+if [ "${ram:-0}" -ge 25 ]; then ok "free RAM" "$ram MB"
+elif [ "${ram:-0}" -ge 12 ]; then att "free RAM" "$ram MB"
+else bad "free RAM" "${ram:-?} MB (Asterisk refuses calls below 8 MB)"; fi
+tmpu=$(df /tmp | awk 'NR==2{sub("%","",$5); print $5}')
+check "$(b '[ "${tmpu:-100}" -lt 70 ]')" "/tmp (RAM)" "${tmpu}% used" att
+extra=$($CLI "logger show channels" 2>/dev/null | grep -c '^/tmp/')
+check "$(b '[ "$extra" = 0 ]')" "debug traces" "$([ "$extra" = 0 ] && echo none || echo "$extra log channel(s) to /tmp still active")" att
+
+# --- web page (served by uhttpd; the API stays behind the RutOS admin session)
+# no "| grep -q": grep would stop at the first match and uclient-fetch would hang for ~30 s
+# (server timeout), which exceeded the 30 s rpcd timeout of the Self-test button
+page=$(uclient-fetch -q -T 10 -O- --no-check-certificate https://127.0.0.1/rut360gw/ 2>/dev/null)
+check "$(b 'echo "$page" | grep -q "<title>"')" "web page" "/rut360gw/"
+
+[ "$QUIET" = 1 ] || echo "------"
+if [ "$ko" = 0 ]; then
+	[ "$warn" = 0 ] && echo "SELF-TEST PASSED" || echo "SELF-TEST PASSED ($warn warning(s))"
+	exit 0
+fi
+echo "SELF-TEST FAILED: $ko check(s) failed, $warn warning(s)"
+exit 1

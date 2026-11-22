@@ -1,0 +1,14 @@
+Reduced pjproject for the rut360gw embedded runtime (build/runtime/build.sh): without OpenSSL
+(--disable-ssl). The external libsrtp2 is kept: pjmedia links it, without depending on OpenSSL.
+
+--- a/Makefile
++++ b/Makefile
+@@ -87,7 +87,7 @@
+ 	--disable-video \
+ 	--enable-shared \
+ 	--with-external-srtp="$(STAGING_DIR)/usr" \
+-	--with-ssl="$(STAGING_DIR)/usr" \
++	--disable-ssl \
+ 	--without-external-gsm \
+ 	--without-external-pa \
+ 	--without-external-webrtc

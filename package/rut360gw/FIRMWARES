@@ -1,0 +1,7 @@
+# RutOS firmwares for which a WebUI (Package Manager) archive is produced.
+# The Package Manager requires "Firmware:" to be IDENTICAL to the router's /etc/version: one archive per version.
+# Only 7.14.5 is supported (last version released for the RUT360, an end-of-life product);
+# 7.04.5 is no longer supported. Automatic updates are frozen by
+# rut360gw-rutos (RutOS FOTA and modem notification).
+# <RutOS version>            <status>
+RUT36X_R_00.07.14.5          validated (QEMU bench and real router)

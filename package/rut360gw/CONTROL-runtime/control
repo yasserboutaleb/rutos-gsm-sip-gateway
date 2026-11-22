@@ -1,0 +1,13 @@
+Package: rut360gw-runtime
+Version: @VERSION@
+Depends: libc
+Source: https://github.com/yasserboutaleb/rutos-gsm-sip-gateway
+License: GPL-2.0-only
+Section: net
+Architecture: mips_24kc
+Maintainer: yasserboutaleb <https://github.com/yasserboutaleb/rutos-gsm-sip-gateway/issues>
+Description: Reduced Asterisk 18 runtime for rut360gw, embedded in flash (~1.8 MB).
+ Archive verified (sha256) then extracted to RAM when the gateway starts, without network.
+ Asterisk 18.15.1 and pjproject 2.12.1 rebuilt without OpenSSL (OpenWrt 21.02 recipes),
+ official OpenWrt 21.02 dependencies, stub libxml2, ALSA and termcap (functions
+ imported but never called). Built by build/runtime in the source repository.

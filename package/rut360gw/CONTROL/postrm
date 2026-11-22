@@ -1,0 +1,39 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+# unload the rpcd plugin "rut360gw" from rpcd
+/etc/init.d/rpcd reload 2>/dev/null
+
+# Uninstall (not upgrade: the package files are then gone): put back the original
+# RutOS settings saved by rut360gw-rutos align (Call Utilities, e-mail forwarding,
+# update checks). Logic copied here because rut360gw-rutos has just been removed.
+ORIG=/etc/rut360gw/rutos.orig
+if [ ! -x /usr/local/usr/sbin/rut360gw-config ] && [ ! -x /usr/sbin/rut360gw-config ] && [ -s "$ORIG" ]; then
+	while IFS='=' read -r k v; do
+		[ -n "$k" ] || continue
+		if [ "$v" = "<absent>" ]; then uci -q delete "$k"; else uci set "$k=$v"; fi
+		uci commit "${k%%.*}"
+	done < "$ORIG"
+	# mobifd keeps call_utils in memory -> reload (data/VoLTE ~1-2 min)
+	if grep -q '^call_utils\.' "$ORIG" && ubus list mobifd >/dev/null 2>&1; then
+		( sleep 2; ubus call mobifd reload '{"cfg_hash_check":true}' ) </dev/null >/dev/null 2>&1 &
+	fi
+	# FOTA check: cron entry reinstalled by its service
+	grep -q '^rut_fota\.' "$ORIG" && [ -x /etc/init.d/rut_fota ] && /etc/init.d/rut_fota restart >/dev/null 2>&1
+	logger -t rut360gw "uninstall: original RutOS settings restored ($(tr '\n' ' ' < "$ORIG"))"
+	rm -f "$ORIG"
+fi
+# Uninstall: remove the firewall rules added by rut360gw-fw (LAN SIP limit,
+# anti-spoofing), then the empty directories opkg leaves behind (rmdir: empty ones only)
+if [ ! -x /usr/local/usr/sbin/rut360gw-config ] && [ ! -x /usr/sbin/rut360gw-config ]; then
+	fw=0
+	for r in rut360gw_antispoof rut360gw_sip_lan rut360gw_sip_lan_drop; do
+		uci -q get "firewall.$r" >/dev/null && { uci -q delete "firewall.$r"; fw=1; }
+	done
+	[ "$fw" = 1 ] && { uci commit firewall; /etc/init.d/firewall reload >/dev/null 2>&1; logger -t rut360gw "uninstall: LAN firewall rules removed"; }
+	for d in /usr/local/usr/share/rut360gw /usr/share/rut360gw /usr/local/www/rut360gw /www/rut360gw /usr/local/www/local /www/local; do
+		[ -d "$d" ] && find "$d" -depth -type d -exec rmdir {} \; 2>/dev/null
+	done
+	# Kept on purpose (reinstall without redoing the setup): /etc/config/rut360gw,
+	# /etc/rut360gw (WireGuard key) and the network.wg_vps tunnel. Full removal: docs/INSTALL.md.
+fi
+exit 0

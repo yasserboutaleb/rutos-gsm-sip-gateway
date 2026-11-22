@@ -1,0 +1,15 @@
+{
+	"rut360gw": {
+		"description": "rut360gw GSM gateway: page http://<router>/rut360gw/",
+		"read": {
+			"ubus": {
+				"rut360gw": [ "status", "self_test", "get_config", "logs", "sms_list", "ussd_history" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"rut360gw": [ "set_config", "restart", "regen_secret", "sms_delete", "ussd_send", "ussd_cancel", "ussd_clear", "fix_call_utils" ]
+			}
+		}
+	}
+}

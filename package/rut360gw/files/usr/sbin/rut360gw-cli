@@ -1,0 +1,12 @@
+#!/bin/sh
+# rut360gw-cli — Asterisk console of the gateway (runtime in RAM, generated configuration).
+#   rut360gw-cli "quectel show devices"     runs one command
+#   rut360gw-cli                            interactive console
+ROOT=/tmp/rut360gw/root
+CONF=/var/run/rut360gw/etc/asterisk.conf
+[ -x "$ROOT/usr/sbin/asterisk" ] || { echo "runtime missing: /etc/init.d/rut360gw start" >&2; exit 1; }
+if [ $# -gt 0 ]; then
+	exec env LD_LIBRARY_PATH="$ROOT/usr/lib:$ROOT/lib" "$ROOT/usr/sbin/asterisk" -C "$CONF" -rx "$*"
+else
+	exec env LD_LIBRARY_PATH="$ROOT/usr/lib:$ROOT/lib" "$ROOT/usr/sbin/asterisk" -C "$CONF" -r
+fi

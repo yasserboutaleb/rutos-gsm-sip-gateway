@@ -1,0 +1,15 @@
+Package: rut360gw
+Version: @VERSION@
+Depends: libc, lua
+Router: RUT360
+tlt_name: RUT360 GSM Gateway (rut360gw)
+Source: https://github.com/yasserboutaleb/rutos-gsm-sip-gateway
+License: GPL-2.0-only
+Section: net
+Architecture: mips_24kc
+Maintainer: yasserboutaleb <https://github.com/yasserboutaleb/rutos-gsm-sip-gateway/issues>
+Description: GSM/VoLTE <-> SIP gateway for Teltonika RUT360 (Quectel EG06-E, RutOS 7.14.5).
+ Asterisk 18 (rut360gw-runtime package extracted to RAM at boot; otherwise signed
+ OpenWrt 21.02 packages are downloaded) + chan_quectel
+ patched to coexist with RutOS gsmd; SIP trunk to a remote server (registration or IP);
+ SMS <-> SIP bridge and USSD through gsmd. Configuration: /etc/config/rut360gw.

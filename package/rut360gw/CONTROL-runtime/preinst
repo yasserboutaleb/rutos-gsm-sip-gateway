@@ -1,0 +1,26 @@
+#!/bin/sh
+# Free-space check for the rut360gw-runtime package.
+# The package declares "Installed-Size: 0": opkg and the WebUI compare that field with the free space
+# WITHOUT subtracting the installed version, and would refuse any new runtime version (~1.8 MB for
+# ~1.7 MB free). The real check is done here, before opkg writes anything: if refused, nothing is
+# modified and the old version stays in place.
+# Space needed = delivered archive + reserve - 85 % of the old archive. opkg replaces it in
+# place; on the RUT360 jffs2 overlay, the space of a deleted or rewritten file becomes available
+# again immediately at ~95 % (measured on a RUT360), the rest after garbage collection.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+ROOT=${PKG_ROOT:-/}
+NEW_KB=@NEW_KB@
+RESERVE_KB=256
+AR="${ROOT%/}/usr/share/rut360gw/runtime.tar.gz"
+old_kb=0
+[ -f "$AR" ] && old_kb=$(( ($(wc -c < "$AR") + 1023) / 1024 ))
+avail_kb=$(df -k "$ROOT" 2>/dev/null | tail -1 | awk '{print $(NF-2)}')
+need_kb=$(( NEW_KB + RESERVE_KB - old_kb * 85 / 100 ))
+case "$avail_kb" in ''|*[!0-9]*) echo "rut360gw-runtime: unreadable free space on $ROOT, installation refused" >&2; exit 1 ;; esac
+if [ "$avail_kb" -lt "$need_kb" ]; then
+	msg="not enough flash space: $avail_kb KB free, $need_kb KB needed (archive $NEW_KB KB, old $old_kb KB, reserve $RESERVE_KB KB). Nothing was modified."
+	echo "rut360gw-runtime: $msg" >&2
+	logger -t rut360gw "rut360gw-runtime: $msg" 2>/dev/null
+	exit 1
+fi
+exit 0

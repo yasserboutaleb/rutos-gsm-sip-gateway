@@ -1,0 +1,37 @@
+#!/bin/sh
+# rut360gw pre-commit — quick checks before each commit (no Docker):
+#   1. no settings/secrets file (.uci, .env, .key, .pub, _private*) added;
+#   2. no sensitive pattern in the ADDED content (patterns from the file named by
+#      RUT360GW_SECRET_PATTERNS, otherwise the built-in list ci/secret-patterns.txt);
+#   3. syntax of the modified shell scripts (sh -n).
+# Install: sh ci/install-hooks.sh    Exceptional bypass: git commit --no-verify
+REPO=$(git rev-parse --show-toplevel)
+PATTERNS=${RUT360GW_SECRET_PATTERNS:-$REPO/ci/secret-patterns.txt}
+# built-in list only: obvious test fixtures are not secrets (same rule as ci/run-local.sh)
+ALLOW='^$'; [ "$PATTERNS" = "$REPO/ci/secret-patterns.txt" ] && ALLOW="'(test|example|dummy|changeme)[^']*'"
+err=0
+files=$(git diff --cached --name-only --diff-filter=ACMR)
+
+for f in $files; do
+	case "$f" in
+		*.uci|*.env|*.key|*.pub|_private*|*/_private*) echo "pre-commit: settings/secrets file rejected: $f"; err=1 ;;
+	esac
+done
+
+if [ -s "$PATTERNS" ]; then
+	hits=$(git diff --cached -U0 --diff-filter=ACMR -- . ':(exclude)third_party' | grep '^+' | grep -v '^+++' | grep -E -f "$PATTERNS" | grep -c -v -E "$ALLOW")
+	[ "$hits" -gt 0 ] && { echo "pre-commit: $hits added line(s) contain a sensitive pattern (see $PATTERNS)"; err=1; }
+else
+	echo "pre-commit: warning, $PATTERNS missing (no secret search)"
+fi
+
+for f in $files; do
+	case "$f" in third_party/*) continue ;; esac
+	[ -f "$f" ] || continue
+	if head -1 "$f" | grep -q -E '^#!.*(/sh|ash|bash)'; then
+		git show ":$f" | sh -n 2>/dev/null || { echo "pre-commit: shell syntax error: $f"; err=1; }
+	fi
+done
+
+[ $err = 0 ] || echo "pre-commit: commit rejected (fix it, or use --no-verify knowingly)"
+exit $err

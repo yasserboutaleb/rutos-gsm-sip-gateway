@@ -1,0 +1,9 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+# The runtime already extracted to RAM (/tmp/rut360gw/root) comes from the previous version, or
+# from the fallback download: mark it stale, it will be replaced by this package's one at the
+# next gateway start. No restart here: the rut360gw package, installed from the same WebUI
+# archive (always at a newer version), restarts the gateway itself right after.
+rm -f /tmp/rut360gw/root/.ready
+echo "rut360gw-runtime installed: used at the next gateway start (/etc/init.d/rut360gw restart)"
+exit 0

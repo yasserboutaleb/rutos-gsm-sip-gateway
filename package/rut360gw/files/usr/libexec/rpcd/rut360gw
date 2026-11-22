@@ -1,0 +1,289 @@
+#!/bin/sh
+# rpcd exec plugin "rut360gw" — API of the web page http://<router>/rut360gw/
+# Called through ubus (`ubus call rut360gw <method>`) or HTTP JSON-RPC (/ubus) with an
+# authenticated RutOS session; permissions defined in /usr/share/rpcd/acl.d/rut360gw.json.
+# Every argument is validated here (regex) before use; no value is evaluated by the shell.
+# Returned messages are in English (the language of the web page).
+#
+# Read  : status, self_test, get_config, logs, sms_list, ussd_history
+# Write : set_config, restart, regen_secret, sms_delete, ussd_send, ussd_cancel, ussd_clear,
+#         fix_call_utils (disables RutOS call handling, which rejects incoming calls)
+#
+# Resources: no daemon added. Each call is a short process; the SMS/USSD methods
+# delegate to rut360gw-sms (Lua), which produces the JSON directly (texts, UTF-8, base64).
+# The remote SIP server is never modified from the router; any VPN (WireGuard, ...) is
+# configured in RutOS, the gateway does not create one (since v0.2).
+
+. /usr/share/libubox/jshn.sh
+
+# RutOS 7.14 installs packages under /usr/local (read-only root); / on the generic test bench
+P=; [ -x /usr/local/usr/sbin/rut360gw-config ] && P=/usr/local
+CLI=$P/usr/sbin/rut360gw-cli
+SMS=${RUT360GW_SMS_BIN:-$P/usr/sbin/rut360gw-sms}   # variable: for testing from /tmp without installing
+USSD_LOCK=/tmp/rut360gw-ussd.lock
+
+get() { v=$(uci -q get "rut360gw.$1"); [ -n "$v" ] && echo "$v" || echo "$2"; }
+ok_ipv4() { echo "$1" | grep -q -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+ok_host() { echo "$1" | grep -q -E '^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'; }
+ok_ext() { echo "$1" | grep -q -E '^[0-9A-Za-z_+-]{1,32}$'; }
+ok_country() { echo "$1" | grep -q -E '^[a-z]{2}$'; }
+ok_port() { echo "$1" | grep -q -E '^[0-9]{1,5}$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+ok_bool() { [ "$1" = 0 ] || [ "$1" = 1 ]; }
+ok_user() { echo "$1" | grep -q -E '^[A-Za-z0-9_.-]{1,32}$'; }
+ok_pass() { echo "$1" | grep -q -E '^[A-Za-z0-9_.@%+=:,-]{8,64}$'; }
+# SIP server password (set by its administrator): anything except | ; \ " and newline
+ok_spass() { [ ${#1} -ge 1 ] && [ ${#1} -le 128 ] || return 1; case "$1" in *'|'*|*';'*|*'\'*|*'"'*|*"
+"*) return 1 ;; esac; return 0; }
+ok_mode() { [ "$1" = register ] || [ "$1" = ip ]; }
+ok_gsmin() { case "$1" in auto|server|local|both) return 0 ;; esac; return 1; }
+srv() { get "server.$1" "$2"; }
+ok_delay() { echo "$1" | grep -q -E '^[0-9]{2,5}$' && [ "$1" -ge 60 ] && [ "$1" -le 86400 ]; }
+ok_ussd() { echo "$1" | grep -q -E '^[0-9*#]{1,64}$'; }
+ok_index() { echo "$1" | grep -q -E '^([0-9]{1,4}|all)$'; }
+
+reply_error() { json_init; json_add_boolean ok 0; json_add_string error "$1"; json_dump; exit 0; }
+reply_ok() { json_init; json_add_boolean ok 1; [ -n "$1" ] && json_add_string message "$1"; json_dump; }
+version() { sed -n 's/^Version: //p' $P/usr/lib/opkg/info/rut360gw.control 2>/dev/null; }
+genpass() { head -c 96 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c "$1"; }
+# RutOS call handling (Services > Mobile Utilities > Call Utilities), section "call_utils.call".
+# mobifd handles every incoming call; it applies the "action" option WITHOUT regard to
+# "enabled" (found in the binary and verified on a router):
+#   option absent  -> "Ignoring voice call": the call rings, the gateway answers it
+#   answer         -> mobifd answers it itself (the gateway loses the call)
+#   other value    -> reject (AT+CHUP): reject AND ignore hang up, the caller gets voicemail
+call_utils_blocks() { [ -n "$(uci -q get call_utils.call.action)" ]; }
+
+countries() {
+	{ grep -h -o '^\[[a-z][a-z]\]' $P/usr/share/rut360gw/templates/indications.conf /tmp/rut360gw/root/etc/asterisk/indications.conf 2>/dev/null; } |
+		tr -d '[]' | sort -u
+}
+
+# end of an apply: validation (generation in RAM), commit, restart in the background
+apply_or_revert() {
+	if ! out=$($P/usr/sbin/rut360gw-config generate 2>&1); then
+		uci revert rut360gw
+		reply_error "configuration refused: $(echo "$out" | grep -v '^$' | tail -2 | sed 's/^rut360gw-config: //' | tr '\n' ' ')"
+	fi
+	uci commit rut360gw
+	if [ "$(get main.enabled 0)" = 1 ]; then
+		( sleep 1; /etc/init.d/rut360gw restart >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+	else
+		( /etc/init.d/rut360gw stop >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+	fi
+}
+
+case "$1" in
+list)
+	cat <<'EOF'
+{"status":{},"self_test":{},"get_config":{},"logs":{},"restart":{},"sms_list":{},"ussd_history":{},"ussd_cancel":{},"ussd_clear":{},
+ "set_config":{"enabled":"1","country":"fr","sms_bridge":"1","sms_purge":"1","sms_purge_delay":"300","ussd":"1","ringback":"network","manage_rutos":"1","gsm_in":"auto","server_enabled":"1","server_mode":"register","server_host":"pbx","server_port":"5060","server_username":"gw","server_password":"x","server_extension":"101","server_local_address":"10.8.0.2","local_username":"rut360","local_password":"x","local_disable":"0"},
+ "regen_secret":{"which":"local"},
+ "sms_delete":{"index":"3"},
+ "ussd_send":{"request":"*600#"},
+ "fix_call_utils":{}}
+EOF
+	;;
+call)
+	read -r input
+	[ -n "$input" ] || input='{}'
+	json_load "$input" 2>/dev/null || json_load '{}'
+	case "$2" in
+	status)
+		dev=$($CLI "quectel show devices" 2>/dev/null | awk '$1=="eg06"{print ($3=="Not" ? "Initializing" : $3)}')  # "Not connec(ted)" truncated by the driver
+		reg=$($CLI "pjsip show registrations" 2>/dev/null | grep 'server-reg' | grep -o -E 'Unregistered|Registered|Rejected|Stopped' | head -1)
+		smode=; [ "$(srv enabled 0)" = 1 ] && smode=$(srv mode register)
+		trunk=$($CLI "pjsip show contacts" 2>/dev/null | awk '/server-aor/{print $4, $5}')
+		calls=$($CLI "core show channels count" 2>/dev/null | sed -n 's/^\([0-9]*\) active call.*/\1/p')
+		sig=$(gsmctl -q 2>/dev/null | tr '\n' ' ')
+		sim=$(gsmctl -S -t 2>/dev/null | tr '\n' ' ')
+		json_init
+		json_add_boolean ok 1
+		json_add_string version "$(version)"
+		json_add_boolean enabled "$(get main.enabled 0)"
+		json_add_boolean asterisk "$(pidof asterisk >/dev/null && echo 1 || echo 0)"
+		json_add_string runtime "$($P/usr/sbin/rut360gw-runtime state 2>/dev/null || echo absent)"
+		json_add_boolean smsbridge "$(ps w | grep -q '[r]ut360gw-sms daemon' && echo 1 || echo 0)"
+		json_add_string modem "${dev:-absent}"
+		json_add_string operator "$(gsmctl -o 2>/dev/null)"
+		json_add_string technology "$(gsmctl -t 2>/dev/null)"
+		json_add_string volte "$(gsmctl -v 2>/dev/null)"
+		json_add_string data "$(gsmctl -j 2>/dev/null)"
+		json_add_string signal "$sig"
+		json_add_int sim_used "$(echo "$sim" | sed -n 's/.*Used: *\([0-9]*\).*/\1/p' | grep . || echo -1)"
+		json_add_int sim_total "$(echo "$sim" | sed -n 's/.*Total: *\([0-9]*\).*/\1/p' | grep . || echo -1)"
+		json_add_string server "$smode"
+		json_add_string registration "${reg:-}"
+		json_add_string trunk "${trunk:-}"
+		json_add_int calls "${calls:-0}"
+		json_add_boolean incoming_blocked "$(call_utils_blocks && echo 1 || echo 0)"
+		json_add_string call_utils_action "$(uci -q get call_utils.call.action)"
+		json_add_boolean manage_rutos "$(get main.manage_rutos 1)"
+		json_add_array rutos_issues
+		tmp=$(mktemp); $P/usr/sbin/rut360gw-rutos status > "$tmp" 2>/dev/null
+		while IFS= read -r l; do json_add_string "" "$l"; done < "$tmp"; rm -f "$tmp"
+		json_close_array
+		json_add_int ram_free_mb "$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"
+		json_add_int uptime_s "$(cut -d. -f1 /proc/uptime)"
+		json_dump
+		;;
+	get_config)
+		json_init
+		json_add_boolean ok 1
+		json_add_boolean enabled "$(get main.enabled 0)"
+		json_add_string country "$(get main.country fr)"
+		json_add_boolean sms_bridge "$(get features.sms_bridge 1)"
+		json_add_boolean sms_purge "$(get features.sms_purge 1)"
+		json_add_int sms_purge_delay "$(get features.sms_purge_delay 300)"
+		json_add_boolean ussd "$(get features.ussd 1)"
+		json_add_string ringback "$(get features.ringback network)"
+		json_add_boolean manage_rutos "$(get main.manage_rutos 1)"
+		json_add_string gsm_in "$(get features.gsm_in auto)"
+		json_add_boolean server_enabled "$(srv enabled 0)"
+		json_add_string server_mode "$(srv mode register)"
+		json_add_string server_host "$(srv host '')"
+		json_add_string server_port "$(srv port 5060)"
+		json_add_string server_username "$(srv username '')"
+		json_add_string server_password "$(srv password '')"
+		json_add_string server_extension "$(srv extension '')"
+		json_add_string server_local_address "$(srv local_address '')"
+		json_add_string local_username "$(get local.username rut360)"
+		json_add_string local_password "$(get local.password '')"
+		json_add_string lan_ip "$(uci -q get network.lan.ipaddr)"
+		json_add_array countries; for c in $(countries); do json_add_string "" "$c"; done; json_close_array
+		json_dump
+		;;
+	logs)
+		json_init; json_add_boolean ok 1
+		json_add_array lines
+		# no "| while": the loop would run in a subshell and jshn would lose the additions
+		tmp=$(mktemp)
+		# raw lines: the page formats them (event log), nothing is computed here.
+		# Never any credential: urcd (RutOS) logs the whole SMTP dialogue of SMS -> e-mail forwarding,
+		# including "AUTH PLAIN <base64 username+password>" and the "334 <base64>" replies.
+		# These lines are dropped even if they contain "rut360gw" (e-mail subject, ...).
+		logread 2>/dev/null | grep -E 'rut360gw|asterisk\[' \
+			| grep -v -E 'urcd|AUTH (PLAIN|LOGIN|CRAM-MD5|XOAUTH2)|[[:space:]]334[[:space:]]' | tail -200 > "$tmp"
+		while IFS= read -r l; do json_add_string "" "$l"; done < "$tmp"
+		rm -f "$tmp"
+		json_close_array; json_dump
+		;;
+	self_test)
+		# read-only self-test (rut360gw-check): OK / WARN / FAIL lines + verdict
+		json_init
+		tmp=$(mktemp)
+		$P/usr/sbin/rut360gw-check > "$tmp" 2>&1; rc=$?
+		json_add_boolean ok 1
+		json_add_boolean passed "$([ "$rc" = 0 ] && echo 1 || echo 0)"
+		json_add_array lines
+		while IFS= read -r l; do json_add_string "" "$l"; done < "$tmp"
+		rm -f "$tmp"
+		json_close_array; json_dump
+		;;
+	restart)
+		[ "$(get main.enabled 0)" = 1 ] || reply_error "the gateway is disabled (enable it in Settings)"
+		( /etc/init.d/rut360gw restart >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+		reply_ok "restart started"
+		;;
+	set_config)
+		for k in enabled country sms_bridge sms_purge sms_purge_delay ussd ringback manage_rutos gsm_in server_enabled server_mode server_host server_port server_username server_password server_extension server_local_address local_username local_password local_disable; do
+			json_get_var "$k" "$k"
+		done
+		[ -z "$enabled" ] || ok_bool "$enabled" || reply_error "invalid value: enabled"
+		[ -z "$country" ] || ok_country "$country" || reply_error "invalid country"
+		[ -z "$sms_bridge" ] || ok_bool "$sms_bridge" || reply_error "invalid value: sms_bridge"
+		[ -z "$sms_purge" ] || ok_bool "$sms_purge" || reply_error "invalid value: sms_purge"
+		[ -z "$sms_purge_delay" ] || ok_delay "$sms_purge_delay" || reply_error "SIM purge delay must be 60 to 86400 seconds"
+		[ -z "$ussd" ] || ok_bool "$ussd" || reply_error "invalid value: ussd"
+		[ -z "$ringback" ] || [ "$ringback" = local ] || [ "$ringback" = network ] || reply_error "ringback must be local or network"
+		[ -z "$manage_rutos" ] || ok_bool "$manage_rutos" || reply_error "invalid value: manage_rutos"
+		[ -z "$gsm_in" ] || ok_gsmin "$gsm_in" || reply_error "invalid value: gsm_in (auto, server, local or both)"
+		[ -z "$server_enabled" ] || ok_bool "$server_enabled" || reply_error "invalid value: server_enabled"
+		[ -z "$server_mode" ] || ok_mode "$server_mode" || reply_error "connection must be register or ip"
+		[ -z "$server_host" ] || ok_host "$server_host" || reply_error "invalid SIP server address"
+		[ -z "$server_port" ] || ok_port "$server_port" || reply_error "invalid SIP port"
+		[ -z "$server_username" ] || ok_user "$server_username" || reply_error "invalid SIP server username (letters, digits, _ . -; 1 to 32)"
+		[ -z "$server_password" ] || ok_spass "$server_password" || reply_error "invalid SIP server password (1 to 128 characters, without | ; \ \")"
+		[ -z "$server_extension" ] || ok_ext "$server_extension" || reply_error "invalid extension (letters, digits, _ + -)"
+		[ -z "$server_local_address" ] || ok_ipv4 "$server_local_address" || reply_error "invalid gateway VPN address (IPv4)"
+		[ -z "$local_username" ] || ok_user "$local_username" || reply_error "invalid LAN SIP username (letters, digits, _ . -; 1 to 32)"
+		[ -z "$local_password" ] || ok_pass "$local_password" || reply_error "invalid LAN SIP password (8 to 64 characters, no spaces)"
+		[ -z "$local_disable" ] || ok_bool "$local_disable" || reply_error "invalid value: local_disable"
+		uci -q get rut360gw.server >/dev/null || uci set rut360gw.server=server
+		[ -n "$enabled" ] && uci set rut360gw.main.enabled="$enabled"
+		[ -n "$country" ] && uci set rut360gw.main.country="$country"
+		[ -n "$sms_bridge" ] && uci set rut360gw.features.sms_bridge="$sms_bridge"
+		[ -n "$sms_purge" ] && uci set rut360gw.features.sms_purge="$sms_purge"
+		[ -n "$sms_purge_delay" ] && uci set rut360gw.features.sms_purge_delay="$sms_purge_delay"
+		[ -n "$ussd" ] && uci set rut360gw.features.ussd="$ussd"
+		[ -n "$ringback" ] && uci set rut360gw.features.ringback="$ringback"
+		[ -n "$manage_rutos" ] && uci set rut360gw.main.manage_rutos="$manage_rutos"
+		[ -n "$gsm_in" ] && uci set rut360gw.features.gsm_in="$gsm_in"
+		[ -n "$server_enabled" ] && uci set rut360gw.server.enabled="$server_enabled"
+		[ -n "$server_mode" ] && uci set rut360gw.server.mode="$server_mode"
+		[ -n "$server_host" ] && uci set rut360gw.server.host="$server_host"
+		[ -n "$server_port" ] && uci set rut360gw.server.port="$server_port"
+		[ -n "$server_username" ] && uci set rut360gw.server.username="$server_username"
+		[ -n "$server_password" ] && uci set rut360gw.server.password="$server_password"
+		[ -n "$server_extension" ] && uci set rut360gw.server.extension="$server_extension"
+		[ -n "$server_local_address" ] && uci set rut360gw.server.local_address="$server_local_address"
+		[ -n "$local_username" ] && uci set rut360gw.local.username="$local_username"
+		[ -n "$local_password" ] && uci set rut360gw.local.password="$local_password"
+		[ "$local_disable" = 1 ] && uci set rut360gw.local.password=''
+		apply_or_revert
+		reply_ok "settings applied"
+		;;
+	regen_secret)
+		json_get_var which which
+		[ "$which" = local ] || reply_error "which must be local"
+		# LAN SIP client: used by the router's Asterisk -> regenerate + restart
+		pw=$(genpass 20)
+		[ ${#pw} -eq 20 ] || reply_error "random generator unavailable"
+		uci set rut360gw.local.password="$pw"
+		apply_or_revert
+		json_init; json_add_boolean ok 1; json_add_string password "$pw"
+		json_add_string message "new LAN SIP password set; the gateway restarts (about 20 s)"; json_dump
+		;;
+	sms_list)
+		$SMS sms-list 2>/dev/null || reply_error "could not read the SIM"
+		;;
+	sms_delete)
+		json_get_var index index
+		ok_index "$index" || reply_error "invalid SMS index"
+		$SMS sms-delete "$index" 2>/dev/null || reply_error "could not delete"
+		;;
+	ussd_history)
+		$SMS ussd-history 2>/dev/null || reply_error "USSD history unavailable"
+		;;
+	ussd_send)
+		json_get_var request request
+		ok_ussd "$request" || reply_error "invalid USSD input (digits, * and # only)"
+		[ "$(get features.ussd 1)" = 1 ] || reply_error "USSD is disabled (Settings)"
+		[ -d "$USSD_LOCK" ] && reply_error "a USSD request is already in progress"
+		# in the background: the network answer may take up to 45 s; the page polls ussd_history
+		( $SMS ussd-web "$request" ) </dev/null >/dev/null 2>&1 &
+		reply_ok "sent"
+		;;
+	ussd_cancel)
+		$SMS ussd-cancel 2>/dev/null || reply_error "could not close the session"
+		;;
+	ussd_clear)
+		# Clear session: closes the USSD session and clears the whole history
+		$SMS ussd-clear 2>/dev/null || reply_error "could not clear the session"
+		;;
+	fix_call_utils)
+		# full alignment of the RutOS settings the gateway needs (see rut360gw-rutos): Call Utilities
+		# (action removed, the only value that lets calls ring on 7.14) and e-mail forwarding (delete_sms=0).
+		# Original values saved, restored on uninstall. On 7.14 mobifd is reloaded once
+		# (it keeps call_utils in memory): mobile data and VoLTE reconnect in ~1-2 min.
+		[ -n "$($P/usr/sbin/rut360gw-rutos status)" ] || { reply_ok "RutOS settings already suit the gateway"; exit 0; }
+		$P/usr/sbin/rut360gw-rutos align >/dev/null 2>&1
+		left=$($P/usr/sbin/rut360gw-rutos status | tr '\n' ';')
+		[ -z "$left" ] || reply_error "could not fix: $left"
+		reply_ok "RutOS settings aligned (original values kept for uninstall). Mobile data and VoLTE reconnect for 1-2 minutes; incoming calls then reach the gateway"
+		;;
+	*)
+		reply_error "unknown method"
+		;;
+	esac
+	;;
+esac

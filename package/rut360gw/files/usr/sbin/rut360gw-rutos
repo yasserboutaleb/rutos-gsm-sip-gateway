@@ -1,0 +1,114 @@
+#!/bin/sh
+# rut360gw-rutos — puts RutOS 7.14.5 into the state the gateway needs, and can undo it.
+#
+#   rut360gw-rutos status    RutOS settings that interfere with the gateway (one line per problem, none = OK)
+#   rut360gw-rutos align     fixes these settings (idempotent), saving the original values first
+#   rut360gw-rutos restore   puts back the saved original values (package removal)
+#
+# Called by /etc/init.d/rut360gw (service start) if rut360gw.main.manage_rutos=1 (default); otherwise
+# the gateway only warns (system log + Dashboard of the web page).
+#
+# Managed settings:
+#  1. Call Utilities (call_utils.call): mobifd hangs up every incoming call as soon as the
+#     "action" option exists (reject AND ignore, even with enabled=0); only its absence lets it ring.
+#     mobifd keeps call_utils IN MEMORY: a change only takes effect after
+#     "ubus call mobifd reload", which reconnects mobile data and VoLTE (~1-2 min). This is
+#     done ONLY if align/restore actually changed call_utils (install, or action set again by hand).
+#  2. Native SMS -> e-mail forwarding (sms_gateway.to_smtp): "delete_sms=1" would delete the SMS
+#     before the bridge relays it to the SIP client -> 0 (the bridge cleans the SIM after relaying).
+#     E-mail forwarding itself is left alone.
+#  3. Updates frozen: RutOS 7.14.5 and the validated modem firmware must not change under the
+#     gateway (driver and runtime depend on them). RutOS FOTA check disabled
+#     (rut_fota.config.enabled=0) and modem update notification turned off (dfota.config.notify=0).
+#     A manual update through the WebUI remains possible: it is then a deliberate choice.
+
+ORIG=/etc/rut360gw/rutos.orig      # "key=value" or "key=<absent>", written once per key
+log() { logger -t rut360gw-rutos "$*"; echo "rut360gw-rutos: $*" >&2; }
+
+apply_call_utils() {
+	ubus list mobifd >/dev/null 2>&1 || return 0
+	log "reloading mobifd to apply call_utils (mobile data and VoLTE reconnect, ~1-2 min)"
+	( sleep 2; ubus call mobifd reload '{"cfg_hash_check":true}' ) </dev/null >/dev/null 2>&1 &
+}
+
+# the RutOS FOTA check is a cron entry installed by its service: restart it so the change is read
+apply_fota() {
+	[ -x /etc/init.d/rut_fota ] && /etc/init.d/rut_fota restart >/dev/null 2>&1
+	return 0
+}
+
+call_utils_blocking() { [ -n "$(uci -q get call_utils.call.action)" ]; }
+smtp_deletes() {
+	uci -q get sms_gateway.to_smtp >/dev/null && [ "$(uci -q get sms_gateway.to_smtp.delete_sms)" = 1 ]
+}
+fota_on() { [ "$(uci -q get rut_fota.config.enabled)" = 1 ]; }
+dfota_on() { [ "$(uci -q get dfota.config.notify)" = 1 ]; }
+
+problems() {
+	call_utils_blocking && echo "call_utils: action \"$(uci -q get call_utils.call.action)\" hangs up incoming calls"
+	uci -q get sms_gateway.to_smtp.enabled | grep -q 1 && smtp_deletes &&
+		echo "sms_gateway: e-mail forwarding deletes SMS before the bridge relays them"
+	fota_on && echo "rut_fota: automatic RutOS update check is on (firmware must stay on 7.14.5)"
+	dfota_on && echo "dfota: modem firmware update notification is on (modem firmware must stay validated)"
+	return 0
+}
+
+# save the original value of a UCI key (only once)
+save() {
+	mkdir -p "${ORIG%/*}"
+	grep -q "^$1=" "$ORIG" 2>/dev/null && return 0
+	v=$(uci -q get "$1"); echo "$1=${v:-<absent>}" >> "$ORIG"
+}
+
+align() {
+	changed=
+	if call_utils_blocking; then
+		save call_utils.call.action; save call_utils.call.enabled
+		uci -q delete call_utils.call.action
+		uci set call_utils.call.enabled=0
+		uci commit call_utils
+		apply_call_utils
+		changed="$changed call_utils"
+	fi
+	if smtp_deletes; then
+		save sms_gateway.to_smtp.delete_sms
+		uci set sms_gateway.to_smtp.delete_sms=0
+		uci commit sms_gateway
+		changed="$changed sms_gateway"
+	fi
+	if fota_on; then
+		save rut_fota.config.enabled
+		uci set rut_fota.config.enabled=0
+		uci commit rut_fota
+		apply_fota
+		changed="$changed rut_fota"
+	fi
+	if dfota_on; then
+		save dfota.config.notify
+		uci set dfota.config.notify=0
+		uci commit dfota
+		changed="$changed dfota"
+	fi
+	[ -n "$changed" ] && log "RutOS aligned for the gateway:$changed (original values: $ORIG)"
+	return 0
+}
+
+restore() {
+	[ -s "$ORIG" ] || return 0
+	while IFS='=' read -r k v; do
+		[ -n "$k" ] || continue
+		if [ "$v" = "<absent>" ]; then uci -q delete "$k"; else uci set "$k=$v"; fi
+		uci commit "${k%%.*}"
+	done < "$ORIG"
+	grep -q "^call_utils\." "$ORIG" && apply_call_utils
+	grep -q "^rut_fota\." "$ORIG" && apply_fota
+	log "original RutOS settings restored ($(tr '\n' ' ' < "$ORIG"))"
+	rm -f "$ORIG"
+}
+
+case "${1:-}" in
+	status) problems ;;
+	align) align ;;
+	restore) restore ;;
+	*) echo "usage: $0 status|align|restore" >&2; exit 2 ;;
+esac

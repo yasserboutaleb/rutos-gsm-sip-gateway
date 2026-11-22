@@ -1,0 +1,2 @@
+# rut360gw: local state to keep across a firmware upgrade (WireGuard keys, SMS already relayed)
+/etc/rut360gw/

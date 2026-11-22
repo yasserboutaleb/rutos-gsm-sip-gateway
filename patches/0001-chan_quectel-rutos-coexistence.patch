@@ -1,0 +1,1278 @@
+diff --git a/third_party/chan_quectel/src/at_command.c b/third_party/chan_quectel/src/at_command.c
+index c20a8b3..fa205d9 100644
+--- a/third_party/chan_quectel/src/at_command.c
++++ b/third_party/chan_quectel/src/at_command.c
+@@ -205,6 +205,38 @@ int at_enqueue_initialization(struct cpvt* cpvt)
+             continue;
+         }
+ 
++        /*
++         * RUT360: these settings are global to the modem (verified on EG06: a change made on
++         * ttyUSB3 is visible from gsmd's ttyUSB2). Leave them to the host (RutOS gsmd).
++         */
++        if (!CONF_SHARED(pvt, shared_cfg)) {
++            switch (st_cmds[in].cmd) {
++                case CMD_AT_CSCS:
++                case CMD_AT_CMEE:
++                case CMD_AT_CSSN:
++                case CMD_AT_VTD:
++                case CMD_AT_COPS_INIT:
++                case CMD_AT_CREG_INIT:
++                    continue;
++                default:
++                    break;
++            }
++        }
++
++        /* RUT360: SMS owned by the host (RutOS gsmd) - do not touch SMS format/storage/indications */
++        if (!CONF_SHARED(pvt, sms)) {
++            switch (st_cmds[in].cmd) {
++                case CMD_AT_CMGF:
++                case CMD_AT_CSCA:
++                case CMD_AT_CNMI:
++                case CMD_AT_CPMS:
++                case CMD_AT_CSMS:
++                    continue;
++                default:
++                    break;
++            }
++        }
++
+         if (!(st_cmds[in].flags & ATQ_CMD_FLAG_STATIC)) {
+             dyn_cmd     = st_cmds[in];
+             dyn_handled = 0;
+@@ -341,6 +373,42 @@ int at_enqueue_initialization_quectel(struct cpvt* cpvt, unsigned int dsci)
+         ATQ_CMD_DECLARE_ST(CMD_AT_FINAL, at),
+     };
+ 
++    if (!CONF_SHARED(pvt, urc_cfg) || !CONF_SHARED(pvt, shared_cfg)) {
++        /*
++         * RUT360: the modem URC port belongs to RutOS gsmd (AT+QURCCFG="urcport","usbat").
++         * +QINDCFG / ^DSCI (urc_cfg=off) and +QTONEDET / +CEREG (shared_cfg=off) are global
++         * to the modem: leave them untouched and rely on AT+CLCC polling (clcc_poll).
++         */
++        at_queue_cmd_t filtered[ARRAY_LEN(cmds)];
++        unsigned out = 0;
++        for (unsigned in = 0; in < ARRAY_LEN(cmds); ++in) {
++            switch (cmds[in].cmd) {
++                case CMD_AT_QINDCFG_CC:
++                case CMD_AT_QINDCFG_CC_OFF:
++                case CMD_AT_DSCI:
++                case CMD_AT_DSCI_OFF:
++                case CMD_AT_QINDCFG_CSQ:
++                case CMD_AT_QINDCFG_ACT:
++                case CMD_AT_QINDCFG_RING:
++                    if (!CONF_SHARED(pvt, urc_cfg)) {
++                        continue;
++                    }
++                    break;
++                case CMD_AT_QTONEDET_0:
++                case CMD_AT_QTONEDET_1:
++                case CMD_AT_CEREG_INIT:
++                    if (!CONF_SHARED(pvt, shared_cfg)) {
++                        continue;
++                    }
++                    break;
++                default:
++                    break;
++            }
++            filtered[out++] = cmds[in];
++        }
++        return at_queue_insert_const(cpvt, filtered, out, 0);
++    }
++
+     return at_queue_insert_const(cpvt, cmds, ARRAY_LEN(cmds), 0);
+ }
+ 
+@@ -964,6 +1032,27 @@ static void at_enqueue_ping_sys_chan(struct pvt* pvt) { at_enqueue_ping(&pvt->sy
+ 
+ int at_enqueue_ping_taskproc(void* tpdata) { return PVT_TASKPROC_TRYLOCK_AND_EXECUTE(tpdata, at_enqueue_ping_sys_chan); }
+ 
++/*
++ * RUT360: periodic AT+CLCC used instead of +QIND "ccinfo" URCs, which RutOS routes
++ * to the gsmd port. Only queued when the device is initialized and the command
++ * queue is idle, so polls never pile up behind real commands.
++ */
++static void at_enqueue_clcc_poll_sys_chan(struct pvt* pvt)
++{
++    DECLARE_AT_CMD(clcc, "+CLCC");
++    static const at_queue_cmd_t cmd = ATQ_CMD_DECLARE_ST(CMD_AT_CLCC, clcc);
++
++    if (!pvt->initialized || at_queue_head_cmd(pvt)) {
++        return;
++    }
++
++    if (at_queue_insert_const(&pvt->sys_chan, &cmd, 1u, 0)) {
++        ast_log(LOG_ERROR, "[%s] Error enqueue CLCC poll\n", PVT_ID(pvt));
++    }
++}
++
++int at_enqueue_clcc_poll_taskproc(void* tpdata) { return PVT_TASKPROC_TRYLOCK_AND_EXECUTE(tpdata, at_enqueue_clcc_poll_sys_chan); }
++
+ /*!
+  * \brief Enqueue user-specified command
+  * \param cpvt -- cpvt structure
+@@ -1294,6 +1383,25 @@ int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause)
+ {
+     struct pvt* const pvt = cpvt->pvt;
+ 
++    /*
++     * RUT360: with AT+QHUP, a call is always hung up by its own index, whatever its state and
++     * the number of calls (AT+CHLD=1x below is never needed, and its upstream command string is
++     * sent without the index). A call the modem has not listed yet only has a provisional index
++     * (pvt_get_pseudo_call_idx): AT+QHUP would aim at nothing, or at a data connection. Such a
++     * call is hung up by AT+CHUP when it is the only one; otherwise as soon as the modem lists it
++     * (handle_clcc). sys_chan callers always pass an index read from AT+CLCC.
++     */
++    if (!pvt->is_simcom && CONF_SHARED(pvt, qhup)) {
++        if (cpvt == &pvt->sys_chan || CPVT_TEST_FLAG(cpvt, CALL_FLAG_IDX_KNOWN)) {
++            return at_enqueue_qhup(cpvt, call_idx, release_cause);
++        }
++        if (PVT_STATE(pvt, chansno) <= 1u) {
++            return at_enqueue_chup(cpvt);
++        }
++        ast_debug(1, "[%s] Call not listed by the modem yet: hangup when it is listed\n", PVT_ID(pvt));
++        return 0;
++    }
++
+     if (cpvt == &pvt->sys_chan || CPVT_DIR_INCOMING(cpvt) || (cpvt->state != CALL_STATE_INIT && cpvt->state != CALL_STATE_DIALING)) {
+         /* FIXME: other channels may be in RELEASED or INIT state */
+         if (PVT_STATE(pvt, chansno) > 1) {
+@@ -1316,6 +1424,45 @@ int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause)
+     }
+ }
+ 
++/*!
++ * \brief RUT360: hang up again a call the modem still lists after its channel was hung up
++ * \param cpvt -- the orphaned call
++ * \param attempt -- 1 for the first new hangup
++ * \return 0 on success
++ *
++ * The EG06 may answer ERROR to AT+QHUP, for example when a call being set up falls back
++ * from LTE to 3G (network without VoLTE). The call then goes on in the modem, and the device
++ * refuses new calls until the network ends it. Odd attempts use AT+CHUP when this call is
++ * the only one known (AT+CHUP releases every voice call, never the data connection); the
++ * others repeat AT+QHUP with the call index.
++ */
++int at_enqueue_hangup_retry(struct cpvt* const cpvt, const unsigned int attempt)
++{
++    struct pvt* const pvt = cpvt->pvt;
++
++    if (pvt->is_simcom || !CONF_SHARED(pvt, qhup) || ((attempt & 1u) && PVT_STATE(pvt, chansno) == 1u)) {
++        return at_enqueue_chup(cpvt);
++    }
++
++    return at_enqueue_qhup(cpvt, cpvt->call_idx, AST_CAUSE_NORMAL_CLEARING);
++}
++
++/*!
++ * \brief RUT360: hang up a call listed by the modem that the driver does not know
++ * \param pvt -- device
++ * \param call_idx -- index read from AT+CLCC
++ * \param use_chup -- use AT+CHUP (caller checked it is the only voice call) instead of AT+QHUP
++ * \return 0 on success
++ */
++int at_enqueue_hangup_unknown(struct pvt* const pvt, const int call_idx, const int use_chup)
++{
++    if (use_chup || pvt->is_simcom || !CONF_SHARED(pvt, qhup)) {
++        return at_enqueue_chup(&pvt->sys_chan);
++    }
++
++    return at_enqueue_qhup(&pvt->sys_chan, call_idx, AST_CAUSE_CALL_REJECTED);
++}
++
+ /*!
+  * \brief Enqueue AT+CLVL commands for volume synchronization
+  * \param cpvt -- cpvt structure
+diff --git a/third_party/chan_quectel/src/at_command.h b/third_party/chan_quectel/src/at_command.h
+index 4e7e194..04bb48e 100644
+--- a/third_party/chan_quectel/src/at_command.h
++++ b/third_party/chan_quectel/src/at_command.h
+@@ -139,6 +139,7 @@ int at_enqueue_initialization_simcom(struct cpvt*);
+ int at_enqueue_initialization_other(struct cpvt*);
+ int at_enqueue_ping(struct cpvt* cpvt);
+ int at_enqueue_ping_taskproc(void*);
++int at_enqueue_clcc_poll_taskproc(void*);
+ int at_enqueue_cspn_cops(struct cpvt* cpvt);
+ int at_enqueue_qspn_qnwinfo(struct cpvt* cpvt);
+ int at_enqueue_sms(struct cpvt* cpvt, const char* sca, const char* destination, const char* msg, unsigned validity_min, int report_req);
+@@ -156,6 +157,8 @@ int at_enqueue_cmgd(struct cpvt* cpvt, unsigned int index, int delflag);
+ int at_enqueue_delete_sms(struct cpvt* cpvt, int idx, tristate_bool_t ack);
+ int at_enqueue_delete_sms_n(struct cpvt* cpvt, int idx, tristate_bool_t ack);
+ int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause);
++int at_enqueue_hangup_retry(struct cpvt* cpvt, unsigned int attempt);
++int at_enqueue_hangup_unknown(struct pvt* pvt, int call_idx, int use_chup);
+ int at_enqueue_volsync(struct cpvt* cpvt);
+ int at_enqueue_clcc(struct cpvt* cpvt);
+ int at_enqueue_activate(struct cpvt* cpvt);
+diff --git a/third_party/chan_quectel/src/at_response.c b/third_party/chan_quectel/src/at_response.c
+index 71c488c..ddb18c6 100644
+--- a/third_party/chan_quectel/src/at_response.c
++++ b/third_party/chan_quectel/src/at_response.c
+@@ -60,6 +60,8 @@ static const at_response_t at_responses_list[] = {
+ #define DEF_STR(str) str, STRLEN(str)
+     {RES_CNUM,  "+CNUM", DEF_STR("ERROR+CNUM:")          },
+     {RES_ERROR, "ERROR", DEF_STR("COMMAND NOT SUPPORT\r")},
++    /* RUT360: the modem-global AT+CMEE=2 set by RutOS gsmd yields verbose errors */
++    {RES_ERROR, "ERROR", DEF_STR("+CME ERROR:")},
+ #undef DEF_STR
+     /* clang-format on */
+ };
+@@ -143,6 +145,7 @@ static void request_clcc(struct pvt* pvt)
+ }
+ 
+ static int at_response_cmgs_error(struct pvt*, const at_queue_task_t* const);
++static void clcc_poll_sweep(struct pvt* const pvt);
+ 
+ static void __attribute__((format(printf, 7, 8))) at_ok_response_log(int level, const char* file, int line, const char* function, const struct pvt* const pvt,
+                                                                      const at_queue_cmd_t* const ecmd, const char* const fmt, ...)
+@@ -192,6 +195,10 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
+         return 0;
+     }
+ 
++    if (ecmd->cmd == CMD_AT_CLCC && CONF_SHARED(pvt, clcc_poll) > 0) {
++        clcc_poll_sweep(pvt);
++    }
++
+     switch (ecmd->cmd) {
+         case CMD_AT:
+         case CMD_AT_Z:
+@@ -256,6 +263,7 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
+ 
+         case CMD_AT_CVOICE:
+             at_ok_response_dbg(1, pvt, ecmd, "Voice calls supported");
++            pvt->voice_init_retries = 0;
+ 
+             switch (CONF_UNIQ(pvt, uac)) {
+                 case TRIBOOL_TRUE:
+@@ -291,7 +299,8 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
+         case CMD_AT_QPCMV_UAC:
+             at_ok_response_dbg(3, pvt, ecmd, NULL);
+ 
+-            pvt->has_voice = 1;
++            pvt->has_voice           = 1;
++            pvt->voice_enable_failed = 0;
+             at_enqueue_qgains(&pvt->sys_chan, CONF_SHARED(pvt, txgain), CONF_SHARED(pvt, rxgain));
+             at_enqueue_query_qgains(&pvt->sys_chan);
+             break;
+@@ -324,6 +333,19 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
+             break;
+ 
+         case CMD_AT_D:
++            if (task->cpvt == &pvt->sys_chan) {
++                /*
++                 * RUT360: the call was released, and its cpvt freed, before its ATD was answered:
++                 * the modem now dials a call nobody owns. Never change the state of sys_chan (it
++                 * would also leave pvt->dialing set). Hang it up by AT+CHUP when no other call
++                 * exists; otherwise the AT+CLCC poll hangs it up as an unknown call.
++                 */
++                ast_log(LOG_WARNING, "[%s] Dial answered after its call was released, hanging up\n", PVT_ID(pvt));
++                if (PVT_NO_CHANS(pvt)) {
++                    at_enqueue_hangup_unknown(pvt, 0, 1);
++                }
++                break;
++            }
+             pvt->dialing = 1;
+             cpvt_change_state(task->cpvt, CALL_STATE_DIALING, 0);
+         /* fall through */
+@@ -663,10 +685,24 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
+ 
+         case CMD_AT_DSCI_OFF:
+             at_err_response_dbg(CONF_SHARED(pvt, dsci) ? 4 : 1, pvt, ecmd, "Error disabling indications");
++            break; /* RUT360: was missing, an error on ^DSCI=0 fell through and disabled voice */
+ 
+         case CMD_AT_CVOICE:
+-            at_err_response_dbg(1, pvt, ecmd, "Voice calls not supported");
+             pvt->has_voice = 0;
++            /* RUT360: right after a modem reset (CFUN=1,1, RutOS reloading the modem, boot) the AT port
++             * can answer before the voice stack and AT+QPCMV? returns ERROR. The init batch stopped here
++             * (CMD_AT_FINAL never ran) and the device stayed "Not initialized" until Asterisk restarted.
++             * Schedule a device restart instead, picked up by the device manager on its next pass
++             * (interval, 15 s), at most 20 times (about 5 min); reset as soon as AT+QPCMV? answers. */
++            if (pvt->voice_init_retries < 20u) {
++                pvt->voice_init_retries++;
++                ast_log(LOG_WARNING, "[%s] AT+QPCMV? refused during init (modem not ready?) - device restart scheduled (%u/20)\n", PVT_ID(pvt),
++                        pvt->voice_init_retries);
++                pvt->desired_state = DEV_STATE_RESTARTED;
++                pvt->restart_time  = RESTATE_TIME_NOW;
++            } else {
++                at_err_response_dbg(1, pvt, ecmd, "Voice calls not supported");
++            }
+             break;
+ 
+         case CMD_AT_CPCMREG:
+@@ -716,7 +752,9 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
+             /* fall through */
+         case CMD_AT_D:
+             at_err_response_err(pvt, ecmd, "Dial failed");
+-            cpvt_change_state(task->cpvt, CALL_STATE_RELEASED, AST_CAUSE_NORMAL_TEMPORARY_FAILURE);
++            if (task->cpvt != &pvt->sys_chan) { /* RUT360: call already released and freed: nothing to release */
++                cpvt_change_state(task->cpvt, CALL_STATE_RELEASED, AST_CAUSE_NORMAL_TEMPORARY_FAILURE);
++            }
+             break;
+ 
+         case CMD_AT_CPCMREG1:
+@@ -735,7 +773,13 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
+         case CMD_AT_CHUP:
+         case CMD_AT_QHUP:
+         case CMD_AT_CHLD_1x:
+-            at_err_response_err(pvt, ecmd, "Error sending hangup for call idx:%d", task->cpvt->call_idx);
++            if (task->cpvt == &pvt->sys_chan) {
++                at_err_response_err(pvt, ecmd, "Error sending hangup for a call unknown to the driver");
++            } else if (!CPVT_TEST_FLAG(task->cpvt, CALL_FLAG_IDX_KNOWN)) {
++                at_err_response_err(pvt, ecmd, "Error sending hangup for a call not listed by the modem yet");
++            } else {
++                at_err_response_err(pvt, ecmd, "Error sending hangup for call idx:%d", task->cpvt->call_idx);
++            }
+             break;
+ 
+         case CMD_AT_CMGR:
+@@ -812,10 +856,12 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
+ 
+         case CMD_AT_QPCMV_TTY:
+             at_err_response_wrn(pvt, ecmd, "Cannot enable audio on serial port");
++            pvt->voice_enable_failed = 1; /* RUT360: e.g. a call left by a crash is in progress: retried (clcc_poll_voice_retry) */
+             break;
+ 
+         case CMD_AT_QPCMV_UAC:
+             at_err_response_wrn(pvt, ecmd, "Cannot enable UAC");
++            pvt->voice_enable_failed = 1;
+             break;
+ 
+         case CMD_AT_QTONEDET_0:
+@@ -920,7 +966,7 @@ static int start_pbx(struct pvt* const pvt, const char* const number, const int
+ 
+     struct cpvt* const cpvt = ast_channel_tech_pvt(channel);
+     // FIXME: not execute if channel_new() failed
+-    CPVT_SET_FLAG(cpvt, CALL_FLAG_NEED_HANGUP);
++    CPVT_SET_FLAGS(cpvt, CALL_FLAG_NEED_HANGUP | CALL_FLAG_IDX_KNOWN); /* RUT360: index read from AT+CLCC */
+ 
+     /* ast_pbx_start() usually failed if asterisk.conf minmemfree
+      * set too low, try drop buffer cache
+@@ -939,21 +985,59 @@ static int start_pbx(struct pvt* const pvt, const char* const number, const int
+     return 0;
+ }
+ 
++/* RUT360: remember a call listed by the current AT+CLCC that the driver does not know (clcc_poll_unknown) */
++static void clcc_unknown_add(struct pvt* const pvt, const unsigned int call_idx, const unsigned int state)
++{
++    if (call_idx <= MAX_CALL_IDX && state <= CALL_STATE_WAITING) {
++        pvt->clcc_unknown[call_idx] = (unsigned char)(state + 1u);
++    }
++}
++
++/*
++ * RUT360: the modem gives an index to a new call as soon as the previous call with this index ends,
++ * which can be before two polls have confirmed that end. A call listed under the index of a known call
++ * but with the other direction, or back to a setup state after being active or held, is a new call.
++ */
++static int clcc_index_reused(const struct cpvt* const cpvt, const unsigned int dir, const unsigned int state)
++{
++    if (dir != CPVT_DIRECTION(cpvt)) {
++        return 1;
++    }
++
++    switch (cpvt->state) {
++        case CALL_STATE_ACTIVE:
++        case CALL_STATE_ONHOLD:
++            return state == CALL_STATE_DIALING || state == CALL_STATE_ALERTING || state == CALL_STATE_INCOMING || state == CALL_STATE_WAITING;
++
++        default:
++            return 0;
++    }
++}
++
+ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, const unsigned int dir, const unsigned int state, const unsigned int mode,
+                         const tristate_bool_t mpty, const char* const number, const unsigned int type)
+ {
+     struct cpvt* cpvt = pvt_channel_find_by_call_idx(pvt, (int)call_idx);
+     int process_state = 1;
+ 
+-    if (cpvt) {
+-        /* cpvt alive */
+-        CPVT_SET_FLAG(cpvt, CALL_FLAG_ALIVE);
++    if (cpvt && CONF_SHARED(pvt, clcc_poll) > 0 && state != CALL_STATE_RELEASED && clcc_index_reused(cpvt, dir, state)) {
++        /* RUT360: the previous call with this index is over: release it, then handle the new call. Before,
++         * the new call was ignored ("direction mismatch") and the previous one kept, which the AT+CLCC
++         * sweep could even take for a call refusing its hangup and hang up the new call (report 14). */
++        ast_log(LOG_WARNING, "[%s] CLCC poll - call idx:%u reused by the modem for a new call, previous call released\n", PVT_ID(pvt), call_idx);
++        cpvt_change_state(cpvt, CALL_STATE_RELEASED, AST_CAUSE_NORMAL_CLEARING);
++        cpvt = NULL;
++    }
+ 
++    if (cpvt) {
+         if (dir != CPVT_DIRECTION(cpvt)) {
+             ast_log(LOG_ERROR, "[%s] CLCC call idx:%d - direction mismatch %d/%d\n", PVT_ID(pvt), cpvt->call_idx, dir, CPVT_DIRECTION(cpvt));
+             return;
+         }
+ 
++        /* cpvt alive (RUT360: only once the direction matches, otherwise this is another call) */
++        CPVT_SET_FLAGS(cpvt, CALL_FLAG_ALIVE | CALL_FLAG_IDX_KNOWN);
++
+         if (mpty) {
+             if (CONF_SHARED(pvt, multiparty)) {
+                 if (mpty > 0) {
+@@ -974,10 +1058,14 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
+             process_state = cpvt_change_state(cpvt, state, 0);
+         }
+     } else {
++        const int polling = CONF_SHARED(pvt, clcc_poll) > 0;
++
+         switch (state) {
+             case CALL_STATE_DIALING:
+             case CALL_STATE_ALERTING:
+-                cpvt = pvt_channel_find_last_initialized(pvt);
++                /* RUT360: with AT+CLCC polling, only an outgoing call whose ATD was answered and that
++                 * the modem has not listed yet can be this one (pvt_channel_find_unlisted_outgoing) */
++                cpvt = polling ? pvt_channel_find_unlisted_outgoing(pvt) : pvt_channel_find_last_initialized(pvt);
+ 
+                 if (mpty) {
+                     if (!CONF_SHARED(pvt, multiparty)) {
+@@ -988,14 +1076,45 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
+                 }
+ 
+                 if (cpvt) {
+-                    cpvt->call_idx = (short)call_idx;
+-                    process_state  = cpvt_change_state(cpvt, state, 0);
++                    const unsigned int waited = cpvt->clcc_miss;
++
++                    cpvt->call_idx  = (short)call_idx;
++                    cpvt->clcc_miss = 0u;
++                    CPVT_SET_FLAGS(cpvt, CALL_FLAG_ALIVE | CALL_FLAG_IDX_KNOWN);
++                    if (polling && waited >= 2u) {
++                        /* RUT360: the first version of the sweep released such a call after two polls */
++                        ast_log(LOG_WARNING, "[%s] CLCC poll - outgoing call listed by the modem after %u polls, idx:%u\n", PVT_ID(pvt), waited + 1u,
++                                call_idx);
++                    }
++                    process_state = cpvt_change_state(cpvt, state, 0);
++                    if (!cpvt->channel && !process_state) {
++                        /* RUT360: hung up by Asterisk before the modem listed it: hang up now by its real index
++                         * (a change of state does it in change_state_no_channel) */
++                        ast_debug(1, "[%s] CLCC poll - call idx:%u listed after its hangup, hanging up\n", PVT_ID(pvt), call_idx);
++                        at_enqueue_hangup(cpvt, cpvt->call_idx, AST_CAUSE_NORMAL_CLEARING);
++                    }
++                } else if (polling) {
++                    clcc_unknown_add(pvt, call_idx, state);
++                    process_state = 0;
+                 } else {
+                     at_enqueue_hangup(&pvt->sys_chan, call_idx, AST_CAUSE_CALL_REJECTED);
+                     ast_log(LOG_ERROR, "[%s] Answered unexisting or multiparty incoming call - idx:%d, hanging up!\n", PVT_ID(pvt), call_idx);
+                     process_state = 0;
+                 }
+                 break;
++
++            case CALL_STATE_ACTIVE:
++            case CALL_STATE_ONHOLD:
++                /* RUT360: an active or held call the driver does not know (released too early, or answered
++                 * by someone else): nobody is on the SIP side, it is hung up by clcc_poll_unknown() */
++                if (polling) {
++                    clcc_unknown_add(pvt, call_idx, state);
++                    process_state = 0;
++                }
++                break;
++
++            default:
++                break;
+         }
+     }
+ 
+@@ -1141,8 +1260,11 @@ static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const r
+     }
+ 
+     struct cpvt* cpvt;
+-    AST_LIST_TRAVERSE(&pvt->chans, cpvt, entry) {
+-        CPVT_RESET_FLAG(cpvt, CALL_FLAG_ALIVE);
++    if (!CONF_SHARED(pvt, clcc_poll)) {
++        /* with clcc_poll, ALIVE flags are cleared by clcc_poll_sweep() after each final OK */
++        AST_LIST_TRAVERSE(&pvt->chans, cpvt, entry) {
++            CPVT_RESET_FLAG(cpvt, CALL_FLAG_ALIVE);
++        }
+     }
+ 
+     RAII_VAR(struct ast_str*, line, ast_str_create(LINE_DEF_LEN), ast_free);
+@@ -1162,17 +1284,244 @@ static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const r
+             continue;
+         }
+ 
+-        if (mode > CALL_STATE_WAITING) {
++        if (state > CALL_STATE_WAITING) { /* RUT360: upstream tested mode here, which is always voice at this point */
+             ast_debug(4, "[%s] CLCC - invalid call state, idx:%u dir:%u state:%u nubmer:%s\n", PVT_ID(pvt), call_idx, dir, state, number);
+             continue;
+         }
+ 
++        ++pvt->clcc_nvoice; /* RUT360: voice calls listed by this AT+CLCC (clcc_poll_unknown) */
+         handle_clcc(pvt, call_idx, dir, state, mode, mpty ? TRIBOOL_TRUE : TRIBOOL_FALSE, number, type);
+     }
+ 
+     return 0;
+ }
+ 
++/*
++ * RUT360: without +QIND "ccinfo" URCs nothing signals a call end, so a call that
++ * is no longer listed by AT+CLCC is released here. Called on the final OK of every
++ * AT+CLCC (also when the list is empty, which produces no +CLCC line at all).
++ * - A call the modem has listed is released after two consecutive misses.
++ * - An outgoing call the modem has not listed yet (no CALL_FLAG_IDX_KNOWN) is judged
++ *   differently: not before its ATD is answered (30 polls at most), then 10 polls to
++ *   appear while it is set up (the LTE -> 3G fallback of a network without VoLTE delays
++ *   it by seconds: with two polls, such calls failed), or two once Asterisk hung it up.
++ * - A call still listed after its channel was hung up is hung up again (clcc_poll_orphan).
++ * - Calls listed by the modem that the driver does not know are hung up (clcc_poll_unknown).
++ * ALIVE flags are cleared afterwards for the next poll.
++ */
++static void clcc_poll_orphan(struct pvt* const pvt, struct cpvt* const cpvt);
++static void clcc_poll_unknown(struct pvt* const pvt);
++static void clcc_poll_voice_retry(struct pvt* const pvt, unsigned int nvoice);
++
++/* RUT360: the call still has a command in the AT queue (its ATD not answered yet) */
++static int cpvt_has_queued_task(const struct pvt* const pvt, const struct cpvt* const cpvt)
++{
++    const struct at_queue_task* task;
++
++    AST_LIST_TRAVERSE(&pvt->at_queue, task, entry) {
++        if (task->cpvt == cpvt) {
++            return 1;
++        }
++    }
++
++    return 0;
++}
++
++static void clcc_poll_sweep(struct pvt* const pvt)
++{
++    struct cpvt* cpvt;
++    const unsigned int nvoice = pvt->clcc_nvoice; /* reset by clcc_poll_unknown() */
++
++    if (!pvt->initialized) {
++        return;
++    }
++
++    {
++        static const unsigned int MISS_KNOWN    = 2u;  /* listed call, or not listed and already hung up */
++        static const unsigned int MISS_UNLISTED = 10u; /* outgoing call being set up, not listed yet */
++        static const unsigned int MISS_PENDING  = 30u; /* outgoing call whose ATD is not answered yet */
++
++        struct {
++            unsigned int idx;
++            unsigned int dir;
++        } gone[MAX_CALL_IDX + 1];
++        unsigned int ngone = 0u;
++
++        AST_LIST_TRAVERSE(&pvt->chans, cpvt, entry) {
++            if (CPVT_TEST_FLAG(cpvt, CALL_FLAG_ALIVE) || cpvt->state == CALL_STATE_RELEASED) {
++                cpvt->clcc_miss = 0u;
++                if (CPVT_TEST_FLAG(cpvt, CALL_FLAG_ALIVE) && !cpvt->channel && cpvt->state != CALL_STATE_RELEASED) {
++                    clcc_poll_orphan(pvt, cpvt);
++                }
++                continue;
++            }
++
++            ++cpvt->clcc_miss;
++
++            if (!CPVT_TEST_FLAG(cpvt, CALL_FLAG_IDX_KNOWN)) {
++                const int queued         = cpvt_has_queued_task(pvt, cpvt);
++                const unsigned int limit = queued ? MISS_PENDING : (cpvt->channel ? MISS_UNLISTED : MISS_KNOWN);
++
++                if (cpvt->clcc_miss >= limit) {
++                    if (cpvt->channel || queued) {
++                        ast_log(LOG_WARNING, "[%s] CLCC poll - outgoing call not listed by the modem after %u polls%s, releasing\n", PVT_ID(pvt),
++                                cpvt->clcc_miss, queued ? " (dial not answered)" : "");
++                    }
++                    if (cpvt->channel && !queued) {
++                        /* in case the modem still sets it up: AT+CHUP if it is the only call (at_enqueue_hangup),
++                         * otherwise it is hung up as an unknown call if the modem lists it later */
++                        at_enqueue_hangup(cpvt, cpvt->call_idx, AST_CAUSE_NORMAL_CLEARING);
++                    }
++                    cpvt_change_state(cpvt, CALL_STATE_RELEASED, AST_CAUSE_NORMAL_TEMPORARY_FAILURE);
++                    break; /* list may have changed, next poll continues */
++                }
++                continue;
++            }
++
++            if (cpvt->clcc_miss >= MISS_KNOWN && ngone < ARRAY_LEN(gone)) {
++                gone[ngone].idx = (unsigned int)cpvt->call_idx;
++                gone[ngone].dir = CPVT_DIRECTION(cpvt);
++                ++ngone;
++            }
++        }
++
++        for (unsigned int i = 0u; i < ngone; ++i) {
++            ast_debug(3, "[%s] CLCC poll - call idx:%u no longer listed, released\n", PVT_ID(pvt), gone[i].idx);
++            handle_clcc(pvt, gone[i].idx, gone[i].dir, CALL_STATE_RELEASED, CLCC_CALL_TYPE_VOICE, TRIBOOL_NONE, "", 0u);
++        }
++    }
++
++    clcc_poll_unknown(pvt);
++    clcc_poll_voice_retry(pvt, nvoice);
++
++    AST_LIST_TRAVERSE(&pvt->chans, cpvt, entry) {
++        CPVT_RESET_FLAG(cpvt, CALL_FLAG_ALIVE);
++    }
++}
++
++/*
++ * RUT360: serial audio (AT+QPCMV=1,0) is enabled once, during initialisation. The modem refuses
++ * it while a voice call is in progress: after a crash of Asterisk during a call, the restarted
++ * driver met the call left open, got ERROR, and stayed without voice (every call refused) until
++ * the next restart, while showing "Free" (seen on the lab, report 14). Enable it again every
++ * 5 polls once no voice call is listed and the driver has no call.
++ */
++static void clcc_poll_voice_retry(struct pvt* const pvt, const unsigned int nvoice)
++{
++    static const unsigned int EVERY = 5u;
++
++    if (!pvt->voice_enable_failed || pvt->has_voice || nvoice || !PVT_NO_CHANS(pvt)) {
++        pvt->voice_retry_polls = 0u;
++        return;
++    }
++    if (++pvt->voice_retry_polls < EVERY) {
++        return;
++    }
++    pvt->voice_retry_polls = 0u;
++
++    switch (CONF_UNIQ(pvt, uac)) {
++        case TRIBOOL_TRUE:
++            ast_log(LOG_WARNING, "[%s] Voice not enabled: enabling it again\n", PVT_ID(pvt));
++            pvt->voice_enable_failed = 0; /* set again if the modem refuses */
++            at_enqueue_enable_uac(&pvt->sys_chan);
++            break;
++
++        case TRIBOOL_FALSE:
++            ast_log(LOG_WARNING, "[%s] Voice not enabled: enabling it again\n", PVT_ID(pvt));
++            pvt->voice_enable_failed = 0;
++            at_enqueue_enable_tty(&pvt->sys_chan);
++            break;
++
++        default:
++            break;
++    }
++}
++
++/*
++ * RUT360: calls listed by the modem that the driver does not know, recorded by handle_clcc():
++ * a call released by the driver while the modem was still setting it up, a cancelled call the
++ * modem listed late, an incoming call answered by someone else. Nobody is on the SIP side:
++ * hang them up. A call being set up is hung up at once, an active or held one after 3 polls
++ * (it may be a call the driver is about to learn about). The hangup is repeated at each poll
++ * while the call is listed; every third one uses AT+CHUP when this is the only voice call
++ * listed and the driver has no call (AT+CHUP releases every voice call), since the modem may
++ * refuse AT+QHUP for a while (report 14).
++ */
++static void clcc_poll_unknown(struct pvt* const pvt)
++{
++    static const unsigned int ACTIVE_GRACE = 3u;
++    static const unsigned int CHUP_EVERY   = 3u;
++
++    for (unsigned int idx = 0u; idx <= MAX_CALL_IDX; ++idx) {
++        const unsigned int listed = pvt->clcc_unknown[idx];
++
++        pvt->clcc_unknown[idx] = 0u;
++        if (!listed) {
++            pvt->clcc_unknown_polls[idx] = 0u;
++            continue;
++        }
++        if (pvt->clcc_unknown_polls[idx] < 255u) {
++            ++pvt->clcc_unknown_polls[idx];
++        }
++
++        const unsigned int polls   = pvt->clcc_unknown_polls[idx];
++        const call_state_t state   = (call_state_t)(listed - 1u);
++        const int being_set_up     = state == CALL_STATE_DIALING || state == CALL_STATE_ALERTING;
++        const unsigned int attempt = being_set_up ? polls : (polls >= ACTIVE_GRACE ? polls - ACTIVE_GRACE + 1u : 0u);
++
++        if (!attempt) {
++            continue;
++        }
++
++        const int use_chup = !(attempt % CHUP_EVERY) && pvt->clcc_nvoice == 1u && PVT_NO_CHANS(pvt);
++
++        if (attempt == 1u || !(attempt % 10u)) {
++            ast_log(LOG_WARNING, "[%s] CLCC poll - unknown call idx:%u (%s) listed by the modem, hanging up (%u)\n", PVT_ID(pvt), idx,
++                    call_state2str(state), attempt);
++        }
++        if (at_enqueue_hangup_unknown(pvt, (int)idx, use_chup)) {
++            ast_log(LOG_ERROR, "[%s] Unable to queue hangup for unknown call idx:%u\n", PVT_ID(pvt), idx);
++        }
++    }
++
++    pvt->clcc_nvoice = 0u;
++}
++
++/*
++ * RUT360: a call still listed by AT+CLCC although its Asterisk channel is gone means the
++ * modem refused the hangup (AT+QHUP answered ERROR, seen in production during the LTE -> 3G
++ * fallback of a call being set up). Without this, the call goes on in the modem (the called
++ * phone keeps ringing) and the device refuses new calls until the network ends it.
++ * Hang up again a few polls apart, falling back to AT+CHUP (see at_enqueue_hangup_retry).
++ * The first new hangup waits 3 polls, so a normal release in progress is not disturbed.
++ */
++static void clcc_poll_orphan(struct pvt* const pvt, struct cpvt* const cpvt)
++{
++    static const unsigned int FIRST = 3u;  /* polls before the first new hangup */
++    static const unsigned int EVERY = 3u;  /* polls between two new hangups */
++    static const unsigned int LIMIT = 20u; /* new hangups before giving up */
++
++    const unsigned int polls = ++cpvt->orphan_polls;
++
++    if (polls < FIRST || (polls - FIRST) % EVERY) {
++        return;
++    }
++
++    const unsigned int attempt = (polls - FIRST) / EVERY + 1u;
++
++    if (attempt > LIMIT) {
++        if (attempt == LIMIT + 1u) {
++            ast_log(LOG_ERROR, "[%s] CLCC poll - call idx:%d still listed after %u new hangups, giving up\n", PVT_ID(pvt), cpvt->call_idx, LIMIT);
++        }
++        return;
++    }
++
++    ast_log(LOG_WARNING, "[%s] CLCC poll - call idx:%d still listed after hangup, hanging up again (%u)\n", PVT_ID(pvt), cpvt->call_idx, attempt);
++    if (at_enqueue_hangup_retry(cpvt, attempt)) {
++        ast_log(LOG_ERROR, "[%s] Unable to queue hangup for call idx:%d\n", PVT_ID(pvt), cpvt->call_idx);
++    }
++}
++
+ static unsigned int map_dsci(const unsigned int dsci)
+ {
+     switch (dsci) {
+@@ -1488,6 +1837,12 @@ static int at_response_cmti(struct pvt* const pvt, const struct ast_str* const r
+ {
+     int idx;
+ 
++    if (!CONF_SHARED(pvt, sms)) {
++        /* RUT360: SMS are owned by the host (RutOS gsmd), never read/delete them here */
++        ast_debug(2, "[%s] SMS handling disabled (sms=off), ignoring '%s'\n", PVT_ID(pvt), ast_str_buffer(response));
++        return 0;
++    }
++
+     if (at_parse_cmti(ast_str_buffer(response), &idx)) {
+         ast_log(LOG_WARNING, "[%s] Error parsing incoming message alert '%s', ignoring\n", PVT_ID(pvt), ast_str_buffer(response));
+         return -1;
+@@ -1520,6 +1875,11 @@ static int at_response_cdsi(struct pvt* const pvt, const struct ast_str* const r
+ {
+     int idx;
+ 
++    if (!CONF_SHARED(pvt, sms)) {
++        ast_debug(2, "[%s] SMS handling disabled (sms=off), ignoring '%s'\n", PVT_ID(pvt), ast_str_buffer(response));
++        return 0;
++    }
++
+     if (at_parse_cdsi(ast_str_buffer(response), &idx)) {
+         ast_log(LOG_WARNING, "[%s] Error parsing incoming message alert '%s', ignoring\n", PVT_ID(pvt), ast_str_buffer(response));
+         return -1;
+@@ -2634,6 +2994,15 @@ static int at_response_psnwid(struct pvt* const pvt, const struct ast_str* const
+     }
+ 
+     char utf8_str[50];
++    if (!CONF_SHARED(pvt, shared_cfg)) {
++        /* RUT360: AT+CSCS left to the host ("GSM"), names are plain text */
++        ast_string_field_set(pvt, network_name, fnn);
++        ast_string_field_set(pvt, short_network_name, snn);
++        pvt->operator= mcc * 100 + mnc;
++        ast_verb(1, "[%s] Operator: %s/%s\n", PVT_ID(pvt), pvt->network_name, pvt->short_network_name);
++        return 0;
++    }
++
+     if (from_ucs2(fnn, utf8_str, STRLEN(utf8_str))) {
+         ast_log(LOG_ERROR, "[%s] Error decoding full network name: %s\n", PVT_ID(pvt), fnn);
+         return -1;
+diff --git a/third_party/chan_quectel/src/chan_quectel.c b/third_party/chan_quectel/src/chan_quectel.c
+index 195ec39..3316e9f 100644
+--- a/third_party/chan_quectel/src/chan_quectel.c
++++ b/third_party/chan_quectel/src/chan_quectel.c
+@@ -177,7 +177,7 @@ void pvt_disconnect(struct pvt* pvt)
+     pvt->has_subscriber_number = 0;
+ 
+     pvt->gsm_registered   = 0;
+-    pvt->has_sms          = CONF_SHARED(pvt, msg_direct) ? 0 : 1;
++    pvt->has_sms          = (CONF_SHARED(pvt, msg_direct) || !CONF_SHARED(pvt, sms)) ? 0 : 1;
+     pvt->has_voice        = 0;
+     pvt->has_call_waiting = 0;
+ 
+@@ -502,7 +502,11 @@ int pvt_get_pseudo_call_idx(const struct pvt* pvt)
+         SET_BIT(bits, cpvt->call_idx);
+     }
+ 
+-    for (dwords = 1; dwords <= MAX_CALL_IDX; dwords++) {
++    /*
++     * RUT360: provisional index taken from the top of the range, so that it never equals an
++     * index the modem uses (data connections first, then voice calls, from 1 upwards).
++     */
++    for (dwords = MAX_CALL_IDX; dwords >= 1; dwords--) {
+         if (!TEST_BIT(bits, dwords)) {
+             return dwords;
+         }
+@@ -954,6 +958,25 @@ struct cpvt* pvt_channel_find_last_initialized(struct pvt* pvt)
+     return res;
+ }
+ 
++/*
++ * RUT360: the outgoing call a newly listed dialing/alerting call belongs to, with AT+CLCC polling.
++ * Only a call whose ATD was answered OK (state DIALING) and that the modem has not listed yet
++ * qualifies: never an active or held call (pvt_channel_find_last_initialized would accept them
++ * and give them the new index), nor a call whose ATD is still queued (the listed call cannot be it).
++ */
++struct cpvt* pvt_channel_find_unlisted_outgoing(struct pvt* pvt)
++{
++    struct cpvt* cpvt;
++
++    AST_LIST_TRAVERSE(&pvt->chans, cpvt, entry) {
++        if (CPVT_DIR_OUTGOING(cpvt) && cpvt->state == CALL_STATE_DIALING && !CPVT_TEST_FLAG(cpvt, CALL_FLAG_IDX_KNOWN)) {
++            return cpvt;
++        }
++    }
++
++    return NULL;
++}
++
+ #/* */
+ 
+ static const char* pvt_state_base(const struct pvt* const pvt)
+@@ -968,6 +991,8 @@ static const char* pvt_state_base(const struct pvt* const pvt)
+         state = "Not initialized";
+     } else if (!pvt->gsm_registered) {
+         state = "GSM not registered";
++    } else if (!pvt->has_voice && CONF_UNIQ(pvt, uac) != TRIBOOL_NONE) {
++        state = "NoVoice"; /* RUT360: every call is refused (pvt_ready4voice_call): never show "Free" */
+     }
+     return state;
+ }
+@@ -1130,7 +1155,7 @@ static struct pvt* pvt_create(const pvt_config_t* settings)
+     pvt->audio_fd           = -1;
+     pvt->data_fd            = -1;
+     pvt->gsm_reg_status     = -1;
+-    pvt->has_sms            = SCONFIG(settings, msg_direct) ? 0 : 1;
++    pvt->has_sms            = (SCONFIG(settings, msg_direct) || !SCONFIG(settings, sms)) ? 0 : 1;
+     pvt->incoming_sms_index = -1;
+     pvt->incoming_sms_type  = RES_UNKNOWN;
+     pvt->desired_state      = SCONFIG(settings, init_state);
+diff --git a/third_party/chan_quectel/src/chan_quectel.h b/third_party/chan_quectel/src/chan_quectel.h
+index 5e249b1..481c9b4 100644
+--- a/third_party/chan_quectel/src/chan_quectel.h
++++ b/third_party/chan_quectel/src/chan_quectel.h
+@@ -177,6 +177,14 @@ typedef struct pvt {
+     volatile restate_time_t restart_time; /*!< time when change state */
+     volatile dev_state_t current_state;   /*!< current state */
+ 
++    /* RUT360: AT+CLCC polling (clcc_poll) */
++    unsigned int clcc_nvoice;                           /*!< voice calls listed by the AT+CLCC being processed */
++    unsigned char clcc_unknown[MAX_CALL_IDX + 1];       /*!< calls unknown to the driver listed by it: call state + 1, 0 = not listed */
++    unsigned char clcc_unknown_polls[MAX_CALL_IDX + 1]; /*!< consecutive polls listing each unknown call */
++    unsigned int voice_enable_failed;                   /*!< AT+QPCMV=1,x refused: enable it again (clcc_poll_voice_retry) */
++    unsigned int voice_init_retries;                    /*!< RUT360: AT+QPCMV? refused during init (modem still booting): restarts scheduled */
++    unsigned int voice_retry_polls;                     /*!< polls since the last attempt to enable voice */
++
+     pvt_config_t settings; /*!< all device settings from config file */
+     pvt_state_t state;     /*!< state */
+     pvt_stat_t stat;       /*!< various statistics */
+@@ -253,6 +261,7 @@ static inline struct pvt* pvt_msg_find_by_resource(const char* resource, unsigne
+ struct cpvt* pvt_channel_find_by_call_idx(struct pvt* pvt, int call_idx);
+ struct cpvt* pvt_channel_find_active(struct pvt* pvt);
+ struct cpvt* pvt_channel_find_last_initialized(struct pvt* pvt);
++struct cpvt* pvt_channel_find_unlisted_outgoing(struct pvt* pvt);
+ 
+ void pvt_unlock(struct pvt* const pvt);
+ 
+diff --git a/third_party/chan_quectel/src/channel.c b/third_party/chan_quectel/src/channel.c
+index 873f2b9..7f1aaea 100644
+--- a/third_party/chan_quectel/src/channel.c
++++ b/third_party/chan_quectel/src/channel.c
+@@ -38,6 +38,11 @@
+ #define ESTRPIPE EPIPE
+ #endif
+ 
++/* RUT360: lock the captured pvt and revalidate the cpvt (see cpvt_channel_lock() in cpvt.c).
++ * varname is NULL if the cpvt was released while waiting: do nothing and return.
++ * Always unlocks the pvt that was locked, never a pvt read again from the cpvt. */
++#define SCOPED_CHANNEL_PVT(varname, chan_, cpvt_, pvt_) RAII_VAR(struct pvt* const, varname, cpvt_channel_lock((chan_), (cpvt_), (pvt_)), pvt_unlock)
++
+ static int setvar_helper(const struct pvt* const pvt, struct ast_channel* chan, const char* name, const char* value)
+ {
+     if (ast_strlen_zero(name) || ast_strlen_zero(value)) {
+@@ -287,23 +292,29 @@ static int channel_hangup(struct ast_channel* channel)
+ 
+         SCOPED_MUTEX(pvt_lock, &pvt->lock);
+ 
+-        const int need_hangup  = CPVT_TEST_FLAG(cpvt, CALL_FLAG_NEED_HANGUP) ? 1 : 0;
+-        const int hangup_cause = ast_channel_hangupcause(channel);
++        /* RUT360: the device thread may have released this cpvt (call ended by the network) while we
++         * waited for the lock; it clears tech_pvt before cpvt_free(). Do not touch it any more. */
++        if (ast_channel_tech_pvt(channel) == cpvt) {
++            const int need_hangup  = CPVT_TEST_FLAG(cpvt, CALL_FLAG_NEED_HANGUP) ? 1 : 0;
++            const int hangup_cause = ast_channel_hangupcause(channel);
+ 
+-        ast_debug(1, "[%s] Hanging up call - idx:%d cause:%d needed:%d\n", PVT_ID(pvt), cpvt->call_idx, hangup_cause, need_hangup);
++            ast_debug(1, "[%s] Hanging up call - idx:%d cause:%d needed:%d\n", PVT_ID(pvt), cpvt->call_idx, hangup_cause, need_hangup);
+ 
+-        if (need_hangup) {
+-            if (at_enqueue_hangup(cpvt, cpvt->call_idx, hangup_cause)) {
+-                ast_log(LOG_ERROR, "[%s] Error adding AT+CHUP command to queue, call not terminated!\n", PVT_ID(pvt));
+-            } else {
+-                CPVT_RESET_FLAG(cpvt, CALL_FLAG_NEED_HANGUP);
++            if (need_hangup) {
++                if (at_enqueue_hangup(cpvt, cpvt->call_idx, hangup_cause)) {
++                    ast_log(LOG_ERROR, "[%s] Error adding AT+CHUP command to queue, call not terminated!\n", PVT_ID(pvt));
++                } else {
++                    CPVT_RESET_FLAG(cpvt, CALL_FLAG_NEED_HANGUP);
++                }
+             }
+-        }
+ 
+-        cpvt_call_disactivate(cpvt);
++            cpvt_call_disactivate(cpvt);
+ 
+-        /* drop cpvt->channel reference */
+-        cpvt->channel = NULL;
++            /* drop cpvt->channel reference */
++            cpvt->channel = NULL;
++        } else {
++            ast_debug(1, "[%s] Hangup - call already released by the device\n", PVT_ID(pvt));
++        }
+     }
+ 
+     /* drop channel -> cpvt reference */
+@@ -329,6 +340,10 @@ static int channel_answer(struct ast_channel* channel)
+ 
+     SCOPED_MUTEX(pvt_lock, &pvt->lock);
+ 
++    if (ast_channel_tech_pvt(channel) != cpvt) { /* RUT360: call released while waiting for the lock */
++        return -1;
++    }
++
+     if (CPVT_DIR_INCOMING(cpvt)) {
+         if (at_enqueue_answer(cpvt)) {
+             ast_log(LOG_ERROR, "[%s] Error sending answer commands\n", PVT_ID(pvt));
+@@ -352,6 +367,10 @@ static int channel_digit_begin(struct ast_channel* channel, char digit)
+ 
+     SCOPED_MUTEX(pvt_lock, &pvt->lock);
+ 
++    if (ast_channel_tech_pvt(channel) != cpvt) { /* RUT360: call released while waiting for the lock */
++        return -1;
++    }
++
+     const int rv = at_enqueue_dtmf(cpvt, digit);
+     if (rv) {
+         if (rv == -1974) {
+@@ -595,7 +614,10 @@ static struct ast_frame* channel_read(struct ast_channel* channel)
+     }
+ 
+     struct pvt* const pvt = cpvt->pvt;
+-    SCOPED_CPVT_TL(cpvt_lock, cpvt);
++    SCOPED_CHANNEL_PVT(pvt_locked, channel, cpvt, pvt);
++    if (!pvt_locked) {
++        return &ast_null_frame; /* call released while waiting for the lock */
++    }
+ 
+     ast_debug(8, "[%s] Read - idx:%d state:%s audio_fd:%d\n", PVT_ID(pvt), cpvt->call_idx, call_state2str(cpvt->state), pvt->audio_fd);
+ 
+@@ -811,7 +833,10 @@ static int channel_write(struct ast_channel* channel, struct ast_frame* f)
+     }
+ 
+     struct pvt* const pvt = cpvt->pvt;
+-    SCOPED_CPVT_TL(cpvt_lock, cpvt);
++    SCOPED_CHANNEL_PVT(pvt_locked, channel, cpvt, pvt);
++    if (!pvt_locked) {
++        return 0; /* call released while waiting for the lock: frame dropped */
++    }
+ 
+     const struct ast_format* const fmt = pvt_get_audio_format(pvt);
+     const size_t frame_size            = pvt_get_audio_frame_size(PTIME_PLAYBACK, fmt);
+@@ -857,7 +882,8 @@ static int channel_fixup(struct ast_channel* oldchannel, struct ast_channel* new
+ 
+     SCOPED_MUTEX(pvt_lock, &pvt->lock);
+ 
+-    if (cpvt->channel == oldchannel) {
++    /* RUT360: cpvt revalidated under the lock (it may have been released while waiting) */
++    if (ast_channel_tech_pvt(newchannel) == cpvt && cpvt->channel == oldchannel) {
+         cpvt->channel = newchannel;
+     }
+ 
+@@ -932,7 +958,9 @@ static int channel_indicate(struct ast_channel* channel, int condition, const vo
+                 ast_moh_start(channel, data, NULL);
+             } else {
+                 SCOPED_MUTEX(pvt_lock, &pvt->lock);
+-                at_enqueue_mute(cpvt, 1);
++                if (ast_channel_tech_pvt(channel) == cpvt) { /* RUT360: cpvt revalidated under the lock */
++                    at_enqueue_mute(cpvt, 1);
++                }
+             }
+             break;
+ 
+@@ -941,11 +969,16 @@ static int channel_indicate(struct ast_channel* channel, int condition, const vo
+                 ast_moh_stop(channel);
+             } else {
+                 SCOPED_MUTEX(pvt_lock, &pvt->lock);
+-                at_enqueue_mute(cpvt, 0);
++                if (ast_channel_tech_pvt(channel) == cpvt) { /* RUT360: cpvt revalidated under the lock */
++                    at_enqueue_mute(cpvt, 0);
++                }
+             }
+             break;
+ 
+         case AST_CONTROL_CONNECTED_LINE: {
++            if (!pvt) { /* RUT360: call already released, pvt is NULL: do not lock NULL->lock */
++                break;
++            }
+             struct ast_party_connected_line* const cnncd = ast_channel_connected(channel);
+             SCOPED_MUTEX(pvt_lock, &pvt->lock);
+             ast_log(LOG_NOTICE, "[%s] Connected party is now %s <%s>\n", PVT_ID(pvt), S_COR(cnncd->id.name.valid, cnncd->id.name.str, ""),
+@@ -1155,7 +1188,10 @@ static int channel_func_read(struct ast_channel* channel, attribute_unused const
+     }
+ 
+     if (!strcasecmp(data, "callstate")) {
+-        SCOPED_CPVT_TL(cpvt_lock, cpvt);
++        SCOPED_CHANNEL_PVT(pvt_locked, channel, cpvt, cpvt->pvt);
++        if (!pvt_locked) {
++            return -1;
++        }
+         call_state_t state = cpvt->state;
+         ast_copy_string(buf, call_state2str(state), len);
+     } else {
+@@ -1186,7 +1222,10 @@ static int channel_func_write(struct ast_channel* channel, const char* function,
+             return -1;
+         }
+ 
+-        SCOPED_CPVT_TL(cpvt_lock, cpvt);
++        SCOPED_CHANNEL_PVT(pvt_locked, channel, cpvt, cpvt->pvt);
++        if (!pvt_locked) {
++            return -1;
++        }
+         oldstate = cpvt->state;
+ 
+         if (oldstate == newstate)
+diff --git a/third_party/chan_quectel/src/cpvt.c b/third_party/chan_quectel/src/cpvt.c
+index 7846621..0c51456 100644
+--- a/third_party/chan_quectel/src/cpvt.c
++++ b/third_party/chan_quectel/src/cpvt.c
+@@ -269,7 +269,9 @@ static void change_state_no_channel(struct cpvt* const cpvt, struct pvt* const p
+         case CALL_STATE_ALERTING:
+         case CALL_STATE_INCOMING:
+         case CALL_STATE_WAITING:
+-            if (at_enqueue_hangup(&pvt->sys_chan, cpvt->call_idx, AST_CAUSE_NORMAL_UNSPECIFIED)) {
++            /* RUT360: the call itself, not sys_chan, so that a provisional index is never used
++             * (at_enqueue_hangup); its queued commands go to sys_chan if it is freed first */
++            if (at_enqueue_hangup(cpvt, cpvt->call_idx, AST_CAUSE_NORMAL_UNSPECIFIED)) {
+                 ast_log(LOG_ERROR, "[%s] Unable to hangup call id:%d\n", PVT_ID(pvt), cpvt->call_idx);
+             }
+             break;
+@@ -407,6 +409,40 @@ void cpvt_unlock(struct cpvt* const cpvt)
+     pvt_unlock(cpvt->pvt);
+ }
+ 
++/*
++ * RUT360: lock fix ("Task skipping: no lock" for ever after a call, found on an EC25).
++ *
++ * The device thread (pvt locked) releases the cpvt when the call ends (CLCC poll "no longer
++ * listed", ^DSCI end, NO CARRIER): change_state(RELEASED) clears ast_channel_tech_pvt(channel)
++ * then calls cpvt_free(). Meanwhile the channel thread may wait for pvt->lock in channel_write()
++ * or channel_read(). The old SCOPED_CPVT_TL read cpvt->pvt from the FREED cpvt to unlock, so the
++ * real pvt->lock could stay locked and the device was dead until Asterisk restarted. Also,
++ * cpvt_try_lock() locked nothing when cpvt->channel was NULL while cpvt_unlock() still unlocked.
++ *
++ * Here the captured pvt is locked BEFORE waiting (pvts live as long as the module), then the cpvt
++ * is revalidated under the lock: the channel must still own it. The unlock always uses that same
++ * pvt pointer (see SCOPED_CHANNEL_PVT in channel.c).
++ */
++struct pvt* cpvt_channel_lock(struct ast_channel* const channel, const struct cpvt* const cpvt, struct pvt* const pvt)
++{
++    if (!channel || !cpvt || !pvt) {
++        return NULL;
++    }
++
++    while (ast_mutex_trylock(&pvt->lock)) {
++        CHANNEL_DEADLOCK_AVOIDANCE(channel);
++    }
++
++    /* tech_pvt is cleared under pvt->lock before any cpvt_free() of an attached cpvt:
++     * if the channel still points to this cpvt, it is alive and cpvt->channel can be read. */
++    if (ast_channel_tech_pvt(channel) != cpvt || cpvt->channel != channel || cpvt->pvt != pvt) {
++        ast_mutex_unlock(&pvt->lock);
++        return NULL;
++    }
++
++    return pvt;
++}
++
+ void* cpvt_get_buffer(struct cpvt* const cpvt) { return cpvt->buffer + AST_FRIENDLY_OFFSET; }
+ 
+ struct ast_frame* cpvt_prepare_voice_frame(struct cpvt* const cpvt, void* const buf, int samples, const struct ast_format* const fmt)
+diff --git a/third_party/chan_quectel/src/cpvt.h b/third_party/chan_quectel/src/cpvt.h
+index ffcb2df..8a40b02 100644
+--- a/third_party/chan_quectel/src/cpvt.h
++++ b/third_party/chan_quectel/src/cpvt.h
+@@ -47,7 +47,8 @@ typedef enum {
+     CALL_FLAG_MULTIPARTY       = 256,  /*!< internal, CLCC mpty is 1 */
+     CALL_FLAG_DIRECTION        = 512,  /*!< call direction */
+     CALL_FLAG_LOCAL_CHANNEL    = 1024, /*!< local channel flag */
+-    CALL_FLAG_INTERNAL_REQUEST = 2048  /*!< internal request */
++    CALL_FLAG_INTERNAL_REQUEST = 2048, /*!< internal request */
++    CALL_FLAG_IDX_KNOWN        = 4096  /*!< RUT360: call_idx comes from the modem (AT+CLCC), not a provisional one */
+ } call_flag_t;
+ 
+ #define CALL_DIR_INCOMING 1u
+@@ -66,6 +67,9 @@ typedef struct cpvt {
+     call_state_t state; /*!< see also call_state_t */
+     unsigned int flags; /*!< see also call_flag_t */
+ 
++    unsigned int clcc_miss;    /*!< RUT360: consecutive AT+CLCC polls not listing this call */
++    unsigned int orphan_polls; /*!< RUT360: AT+CLCC polls still listing this call after its channel was hung up */
++
+     int rd_pipe[2]; /*!< pipe for split read from device */
+ #define PIPE_READ 0
+ #define PIPE_WRITE 1
+@@ -103,6 +107,10 @@ void cpvt_lock(struct cpvt* const);
+ void cpvt_try_lock(struct cpvt* const);
+ void cpvt_unlock(struct cpvt* const);
+ 
++/* RUT360: pvt lock for channel callbacks (read/write/func), with cpvt revalidation.
++ * Returns pvt LOCKED if the channel still owns this cpvt, otherwise NULL (nothing locked). */
++struct pvt* cpvt_channel_lock(struct ast_channel* const channel, const struct cpvt* const cpvt, struct pvt* const pvt);
++
+ void cpvt_call_activate(struct cpvt* const cpvt);
+ void cpvt_call_disactivate(struct cpvt* const cpvt);
+ 
+diff --git a/third_party/chan_quectel/src/dc_config.c b/third_party/chan_quectel/src/dc_config.c
+index c0efdb3..3284405 100644
+--- a/third_party/chan_quectel/src/dc_config.c
++++ b/third_party/chan_quectel/src/dc_config.c
+@@ -197,6 +197,10 @@ void dc_sconfig_fill_defaults(struct dc_sconfig* config)
+     config->msg_service   = -1;
+     config->dtmf_duration = DEF_DTMF_DURATION;
+     config->qhup          = 1u;
++    config->sms           = 1u;
++    config->urc_cfg       = 1u;
++    config->shared_cfg    = 1u;
++    config->clcc_poll     = 0;
+ }
+ 
+ #/* */
+@@ -269,6 +273,16 @@ void dc_sconfig_fill(struct ast_config* cfg, const char* cat, struct dc_sconfig*
+             config->dsci = parse_on_off(v->name, v->value, 0u);
+         } else if (!strcasecmp(v->name, "qhup")) {
+             config->qhup = parse_on_off(v->name, v->value, 1u);
++        } else if (!strcasecmp(v->name, "sms")) {
++            config->sms = parse_on_off(v->name, v->value, 1u);
++        } else if (!strcasecmp(v->name, "urc_cfg")) {
++            config->urc_cfg = parse_on_off(v->name, v->value, 1u);
++        } else if (!strcasecmp(v->name, "shared_cfg")) {
++            config->shared_cfg = parse_on_off(v->name, v->value, 1u);
++        } else if (!strcasecmp(v->name, "clcc_poll")) {
++            const long poll = strtol(v->value, (char**)NULL, 10);
++            /* 0 disables polling; otherwise clamp to a sane range (250 ms .. 10 s) */
++            config->clcc_poll = poll <= 0 ? 0 : (poll < 250 ? 250 : (poll > 10000 ? 10000 : (int)poll));
+         } else if (!strcasecmp(v->name, "msg_direct")) {
+             config->msg_direct = dc_str23stbool(v->value);
+         } else if (!strcasecmp(v->name, "msg_storage")) {
+@@ -346,7 +360,7 @@ static int dc_sconfig_compare(const struct dc_sconfig* const cfg1, const struct
+            cfg1->multiparty != cfg2->multiparty || cfg1->dtmf != cfg2->dtmf || cfg1->moh != cfg2->moh || cfg1->query_time != cfg2->query_time ||
+            cfg1->dsci != cfg2->dsci || cfg1->qhup != cfg2->qhup || cfg1->dtmf_duration != cfg2->dtmf_duration || cfg1->init_state != cfg2->init_state ||
+            cfg1->call_waiting != cfg2->call_waiting || cfg1->msg_service != cfg2->msg_service || cfg1->msg_direct != cfg2->msg_direct ||
+-           cfg1->msg_storage != cfg2->msg_storage;
++           cfg1->msg_storage != cfg2->msg_storage || cfg1->sms != cfg2->sms || cfg1->urc_cfg != cfg2->urc_cfg || cfg1->shared_cfg != cfg2->shared_cfg || cfg1->clcc_poll != cfg2->clcc_poll;
+ }
+ 
+ static int dc_uconfig_compare(const struct dc_uconfig* const cfg1, const struct dc_uconfig* const cfg2)
+diff --git a/third_party/chan_quectel/src/dc_config.h b/third_party/chan_quectel/src/dc_config.h
+index b32a4c2..81e2e17 100644
+--- a/third_party/chan_quectel/src/dc_config.h
++++ b/third_party/chan_quectel/src/dc_config.h
+@@ -66,6 +66,11 @@ typedef struct dc_sconfig {
+     unsigned int query_time      :1; /*! 0 */
+     unsigned int dsci            :1; /*!< use ^DSCI call state notifications */
+     unsigned int qhup            :1; /*!< use QHUP command */
++    unsigned int sms             :1; /*!< RUT360: handle SMS in driver (1) or leave them to the host, e.g. RutOS gsmd (0) */
++    unsigned int urc_cfg         :1; /*!< RUT360: send global +QINDCFG URC settings (1) or leave modem URC config untouched (0) */
++    unsigned int shared_cfg      :1; /*!< RUT360: set modem-global settings CSCS/CMEE/CSSN/VTD/COPS/CREG/CEREG/QTONEDET (1) or leave them to the host (0) */
++
++    int clcc_poll; /*!< RUT360: poll AT+CLCC every N ms when URCs are routed to another port, 0 = off */
+ 
+     long dtmf_duration;          /*! duration of DTMF in miliseconds */
+     dev_state_t init_state;      /*! DEV_STATE_STARTED */
+diff --git a/third_party/chan_quectel/src/monitor_thread.c b/third_party/chan_quectel/src/monitor_thread.c
+index 5df7820..67baafb 100644
+--- a/third_party/chan_quectel/src/monitor_thread.c
++++ b/third_party/chan_quectel/src/monitor_thread.c
+@@ -188,7 +188,8 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
+     }
+ 
+     /* 4 reduce locking time make copy of this readonly fields */
+-    const int fd = pvt->data_fd;
++    const int fd        = pvt->data_fd;
++    const int clcc_poll = CONF_SHARED(pvt, clcc_poll); /* RUT360: AT+CLCC polling period in ms, 0 = off */
+     at_clean_data(dev, fd, &rb);
+ 
+     /* schedule initilization  */
+@@ -199,16 +200,25 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
+ 
+     ast_mutex_unlock(&pvt->lock);
+ 
+-    int read_result = 0;
++    int read_result           = 0;
++    struct timeval last_poll  = ast_tvnow();
++    const int idle_timeout    = clcc_poll > 0 ? clcc_poll : RESPONSE_READ_TIMEOUT;
+     while (1) {
++        if (clcc_poll > 0 && ast_tvdiff_ms(ast_tvnow(), last_poll) >= clcc_poll) {
++            last_poll = ast_tvnow();
++            if (ast_taskprocessor_push(tps, at_enqueue_clcc_poll_taskproc, pvt)) {
++                ast_debug(5, "[%s] Unable to push CLCC poll\n", dev);
++            }
++        }
++
+         if (ast_taskprocessor_push(tps, handle_expired_reports_taskproc, pvt)) {
+             ast_debug(5, "[%s] Unable to handle exprired reports\n", dev);
+         }
+ 
+         if (ast_mutex_trylock(&pvt->lock)) {  // pvt unlocked
+-            int t = RESPONSE_READ_TIMEOUT;
++            int t = idle_timeout;
+             if (!at_wait(fd, &t)) {
+-                if (ast_taskprocessor_push(tps, at_enqueue_ping_taskproc, pvt)) {
++                if (!clcc_poll && ast_taskprocessor_push(tps, at_enqueue_ping_taskproc, pvt)) {
+                     ast_debug(5, "[%s] Unable to handle timeout\n", dev);
+                 }
+                 continue;
+@@ -247,14 +257,29 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
+                     if (!at_wait(fd, &t)) {
+                         continue;
+                     }
+-                } else if (!at_wait(fd, &t)) {
+-                    if (ast_taskprocessor_push(tps, cmd_timeout_taskproc, pvt)) {
+-                        ast_debug(5, "[%s] Unable to handle timeout\n", dev);
++                } else {
++                    /*
++                     * RUT360: with clcc_poll, never sleep longer than the poll period. The head
++                     * command may already be answered (its response is still in the taskprocessor),
++                     * so waiting for its full timeout would stall polling. When the capped wait
++                     * expires before the real deadline, just loop: the deadline is re-evaluated.
++                     */
++                    const int capped = clcc_poll > 0 && t > clcc_poll;
++                    if (capped) {
++                        t = clcc_poll;
++                    }
++                    if (!at_wait(fd, &t)) {
++                        if (capped) {
++                            continue;
++                        }
++                        if (ast_taskprocessor_push(tps, cmd_timeout_taskproc, pvt)) {
++                            ast_debug(5, "[%s] Unable to handle timeout\n", dev);
++                        }
++                        continue;
+                     }
+-                    continue;
+                 }
+             } else {
+-                t = RESPONSE_READ_TIMEOUT;
++                t = idle_timeout;
+                 if (!at_wait(fd, &t)) {
+                     if (check_taskprocessor(tps, dev)) {
+                         if (ast_taskprocessor_push(tps, restart_monitor_taskproc, pvt)) {
+@@ -262,7 +287,7 @@ static void monitor_threadproc_pvt(struct pvt* const pvt)
+                         }
+                     }
+ 
+-                    if (ast_taskprocessor_push(tps, at_enqueue_ping_taskproc, pvt)) {
++                    if (!clcc_poll && ast_taskprocessor_push(tps, at_enqueue_ping_taskproc, pvt)) {
+                         ast_debug(5, "[%s] Unable to handle timeout\n", dev);
+                     }
+                     continue;

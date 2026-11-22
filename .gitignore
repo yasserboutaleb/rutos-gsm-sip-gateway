@@ -1,0 +1,14 @@
+# Build artefacts (the package is rebuilt identically from a commit)
+/out/
+*.ipk
+# Settings and secrets: NEVER in this repository (keep them in private storage)
+_private*/
+*.uci
+*.env
+*.key
+*.pub
+# Temporary patched sources
+/work/
+/dl/
+# Python caches
+__pycache__/

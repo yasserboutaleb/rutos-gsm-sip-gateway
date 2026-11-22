@@ -1,0 +1,231 @@
+#!/bin/sh
+# rut360gw-runtime — prepares the Asterisk environment in RAM (/tmp) on RUT360/RutOS.
+#
+# Why RAM: the RUT360 jffs2 overlay has only ~3.5 MB free. Asterisk is therefore extracted
+# into /tmp/rut360gw/root at every boot, from one of these two sources:
+#  1. the EMBEDDED runtime (package rut360gw-runtime, ~1.8 MB in flash): Asterisk and pjproject
+#     rebuilt without OpenSSL (build/runtime in the repository), archive checked by sha256 then
+#     extracted (~4.4 MB in RAM). No network needed: the gateway starts without Internet;
+#  2. as a FALLBACK (runtime package missing or archive damaged): the 36 official OpenWrt 21.02
+#     packages (4.3 MB compressed, ~10.7 MB installed), downloaded and verified (sha256 taken
+#     from the signed index). Nothing is written to flash.
+#
+# Fallback mirrors: those in /etc/rut360gw/mirrors (one base URL per line, e.g. a private copy
+# reachable through a VPN), then downloads.openwrt.org, then archive.openwrt.org. The sha256
+# sums of the manifest make all mirrors equivalent: a modified file is refused. A failing
+# mirror is skipped for the rest of the pass (an unreachable mirror costs a single 20 s
+# timeout, not one per file).
+#
+# Usage: rut360gw-runtime prepare | embedded | wait | state | status | purge
+#   embedded: embedded runtime only (service start: immediate, no network)
+#   wait    : used by the service when the runtime is not ready (router boot, no 4G):
+#             tries, then retries every 2 min WITHOUT LIMIT; once ready, restarts the service
+#             (RutOS alignment, then Asterisk). Never blocks the router boot.
+#   state   : ready | downloading | waiting_network | low_memory | absent (read by the web page)
+
+set -u
+
+CONF_DIR=${RUT360GW_CONF_DIR:-/etc/rut360gw}   # local options (mirrors); variable: for testing
+# RutOS 7.14 installs packages under /usr/local (read-only root); / on the generic test bench
+P=; [ -x /usr/local/usr/sbin/rut360gw-config ] && P=/usr/local
+SHARE=$P/usr/share/rut360gw          # package files
+MANIFEST=$SHARE/bundle.manifest
+DEFAULT_BASE=/tmp/rut360gw
+BASE=${RUT360GW_RUNTIME_BASE:-$DEFAULT_BASE}   # variable: test run next to the live runtime
+ROOT=$BASE/root
+CACHE=$BASE/cache
+STAMP=$ROOT/.ready
+STATE=/var/run/rut360gw/runtime.state
+# Mirrors tried in order, after those in /etc/rut360gw/mirrors (one base URL per line)
+DEFAULT_MIRRORS="https://downloads.openwrt.org/releases/21.02.0/packages/mips_24kc
+https://archive.openwrt.org/releases/21.02.0/packages/mips_24kc"
+BAD=" "   # mirrors that failed during the current pass
+# embedded runtime (package rut360gw-runtime) and its sha256
+EMBEDDED=$SHARE/runtime.tar.gz
+# exit code of prepare when RAM is short (low_memory state, distinct from waiting for the network)
+RC_LOWMEM=3
+
+log() { logger -t rut360gw "$*"; echo "rut360gw: $*" >&2; }
+dbg() { [ -n "${RUT360GW_DEBUG:-}" ] && logger -t rut360gw "[dbg] $*"; return 0; }
+
+mirrors() {
+	if [ -s "$CONF_DIR/mirrors" ]; then grep -v '^#' "$CONF_DIR/mirrors"; fi
+	echo "$DEFAULT_MIRRORS"
+}
+
+fetch_one() { # $1=feed/file  $2=sha256
+	local rel="$1" sha="$2" file
+	file=$CACHE/$(basename "$rel")
+	if [ -f "$file" ] && [ "$(sha256sum "$file" | cut -d' ' -f1)" = "$sha" ]; then
+		return 0
+	fi
+	rm -f "$file"
+	for m in $(mirrors); do
+		case "$BAD" in *" $m "*) continue ;; esac
+		if wget -q -T 20 -O "$file.part" "$m/$rel" 2>/dev/null &&
+			[ "$(sha256sum "$file.part" | cut -d' ' -f1)" = "$sha" ]; then
+			mv "$file.part" "$file"
+			dbg "$rel <- $m"
+			return 0
+		fi
+		rm -f "$file.part"
+		BAD="$BAD$m "
+		log "mirror skipped for this pass (unreachable or file refused): $m"
+	done
+	log "FAILED download/verification: $rel"
+	return 1
+}
+
+# 3rd manifest column: "ifmissing:<file>" = package needed only if the system does not
+# provide that file (OpenSSL 1.1: missing from RutOS 7.14, which only has OpenSSL 3; present on the generic bench)
+needed() {
+	case "${1:-}" in
+		ifmissing:*) [ ! -e "${1#ifmissing:}" ] ;;
+		*) return 0 ;;
+	esac
+}
+
+# RAM safeguard before writing to /tmp: 15 MB available for the embedded runtime (~4.4 MB
+# extracted), 30 MB for the fallback download (~10.7 MB extracted, plus the cache).
+ram_ok() {
+	local avail need=30
+	[ -f "$EMBEDDED" ] && need=15
+	avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+	[ "${avail:-0}" -ge "$need" ] && return 0
+	log "not enough available RAM (${avail:-?} MB < $need MB): runtime not prepared"
+	return 1
+}
+
+# Embedded runtime: verified (sha256 shipped in the package) then extracted to RAM. No network.
+embedded() {
+	[ -f "$EMBEDDED" ] || return 1
+	local want got
+	want=$(cut -d' ' -f1 "$EMBEDDED.sha256" 2>/dev/null)
+	got=$(sha256sum "$EMBEDDED" | cut -d' ' -f1)
+	if [ -z "$want" ] || [ "$got" != "$want" ]; then
+		log "embedded runtime damaged (sha256): downloading instead"
+		return 1
+	fi
+	rm -rf "$ROOT"; mkdir -p "$ROOT"
+	if ! tar -xzf "$EMBEDDED" -C "$ROOT"; then
+		log "embedded runtime: extraction failed, downloading instead"
+		rm -rf "$ROOT"; mkdir -p "$ROOT"
+		return 1
+	fi
+	dbg "embedded runtime extracted"
+}
+
+finish() {
+	# chan_quectel driver built for this target (small, kept in flash)
+	cp "$SHARE/modules/chan_quectel.so" "$ROOT/usr/lib/asterisk/modules/chan_quectel.so" &&
+		chmod 0755 "$ROOT/usr/lib/asterisk/modules/chan_quectel.so" || { log "chan_quectel.so missing"; return 1; }
+	mkdir -p "$BASE/var/lib/asterisk" "$BASE/var/spool/asterisk" "$BASE/log" /var/run/rut360gw
+	touch "$STAMP"
+	log "runtime ready ($1, $(du -sh "$ROOT" | cut -f1) in RAM)"
+}
+
+prepare() {
+	if [ -f "$STAMP" ]; then
+		# the driver lives in flash and may have been updated: always refresh it
+		cp "$SHARE/modules/chan_quectel.so" "$ROOT/usr/lib/asterisk/modules/chan_quectel.so" &&
+			chmod 0755 "$ROOT/usr/lib/asterisk/modules/chan_quectel.so"
+		log "runtime already ready (driver refreshed)"
+		return 0
+	fi
+	ram_ok || return $RC_LOWMEM
+	embedded && { finish "embedded"; return; }
+	[ -f "$MANIFEST" ] || { log "manifest missing: $MANIFEST"; return 1; }
+
+	mkdir -p "$CACHE" "$ROOT"
+	# Downloads with retries: at router boot the 4G link may not be ready yet, or may drop
+	# for a while (mobifd reload, cell change). Up to 10 passes, 30 s apart
+	# (~5 min); packages already verified stay in the cache and are not downloaded again.
+	local sha rel cond ok=0 pass=0
+	while [ "$ok" = 0 ] && [ "$pass" -lt "${RUT360GW_FETCH_PASSES:-10}" ]; do
+		pass=$((pass + 1)); ok=1; BAD=" "   # each pass gives every mirror a new chance
+		while read -r sha rel cond; do
+			case "$sha" in ''|'#'*) continue ;; esac
+			needed "$cond" || { dbg "skip $rel ($cond)"; continue; }
+			dbg "fetch $rel"
+			# first failure = network probably down: no point waiting for the timeout of every file
+			fetch_one "$rel" "$sha" || { ok=0; break; }
+		done < "$MANIFEST"
+		if [ "$ok" = 0 ] && [ "$pass" -lt "${RUT360GW_FETCH_PASSES:-10}" ]; then
+			log "download incomplete (pass $pass): retrying in 30 s (mobile network not ready yet?)"
+			sleep 30
+		fi
+	done
+	[ "$ok" = 1 ] || return 1
+
+	while read -r sha rel cond; do
+		case "$sha" in ''|'#'*) continue ;; esac
+		needed "$cond" || continue
+		dbg "extract $rel"
+		# an OpenWrt 21.02 .ipk = tar.gz containing data.tar.gz
+		tar -xzOf "$CACHE/$(basename "$rel")" ./data.tar.gz | tar -xz -C "$ROOT" || { log "extraction failed: $rel"; return 1; }
+	done < "$MANIFEST"
+
+	# The cache is useless once extracted: free the RAM
+	dbg "rm cache"
+	rm -rf "$CACHE"
+	dbg "cache removed"
+	finish "downloaded"
+}
+
+status() {
+	[ -f "$STAMP" ] && echo "runtime: ready ($(du -sh "$ROOT" | cut -f1))" || echo "runtime: absent"
+	awk '/MemAvailable/ {printf "RAM available: %d MB\n", $2/1024}' /proc/meminfo
+	df -h /tmp /overlay | tail -n +2
+}
+
+# /var/run/rut360gw (generated configuration, Asterisk socket) belongs to the live runtime only:
+# never deleted for a test base (RUT360GW_RUNTIME_BASE)
+purge() {
+	rm -rf "$BASE"
+	[ "$BASE" = "$DEFAULT_BASE" ] && rm -rf /var/run/rut360gw
+	log "runtime removed from RAM ($BASE)"
+}
+
+set_state() { mkdir -p "${STATE%/*}"; echo "$1" > "$STATE"; }
+
+state() {
+	if [ -f "$STAMP" ]; then echo ready
+	elif [ -s "$STATE" ]; then cat "$STATE"
+	else echo absent; fi
+}
+
+# Wait without limit (procd instance "runtime" of the service): one download pass, then
+# a 2 min pause, forever. Packages already verified stay in the cache between passes.
+wait_ready() {
+	local n=0 rc iv="${RUT360GW_WAIT_INTERVAL:-120}"
+	while :; do
+		set_state downloading
+		RUT360GW_FETCH_PASSES=1 prepare && break
+		rc=$?
+		n=$((n + 1))
+		# RAM shortage: separate state, so that it is not mistaken for a missing network
+		if [ "$rc" = "$RC_LOWMEM" ]; then
+			set_state low_memory
+			[ "$n" = 1 ] && log "runtime not prepared, not enough RAM: retrying every $iv s, without limit"
+		else
+			set_state waiting_network
+			[ "$n" = 1 ] && log "runtime unavailable: retrying every $iv s, without limit (no mobile network?)"
+		fi
+		sleep "$iv"
+	done
+	set_state ready
+	[ "$n" -gt 0 ] && log "runtime ready after $n retries: starting the gateway"
+	# full service restart, detached: procd stops this instance during the restart
+	sh -c 'trap "" HUP TERM; sleep 1; /etc/init.d/rut360gw restart' </dev/null >/dev/null 2>&1 &
+}
+
+case "${1:-}" in
+	prepare) prepare ;;
+	# embedded runtime only (service start: immediate, without waiting for the network)
+	embedded) [ -f "$STAMP" ] || { [ -f "$EMBEDDED" ] && ram_ok && embedded && finish "embedded"; } ;;
+	wait) wait_ready ;;
+	state) state ;;
+	status) status ;;
+	purge) purge ;;
+	*) echo "usage: $0 prepare|embedded|wait|state|status|purge" >&2; exit 2 ;;
+esac

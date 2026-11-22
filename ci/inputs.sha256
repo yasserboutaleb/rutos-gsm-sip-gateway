@@ -1,0 +1,8 @@
+# Local CI inputs: <sha256> <url relative to downloads.openwrt.org/releases/>
+# SDK (driver build) and malta-be rootfs (QEMU bench, same mips_24kc/musl arch)
+71408b147f020dc6d9229f79e9d53219a3c9351034b0e07f073b2c5b22c4dd31 21.02.7/targets/ath79/generic/openwrt-sdk-21.02.7-ath79-generic_gcc-8.4.0_musl.Linux-x86_64.tar.xz
+381ba7ef44bbcd0f86272d904947c9935627c73c727621b0ef404f396362d61f 21.02.7/targets/malta/be/openwrt-21.02.7-malta-be-default-rootfs.tar.gz
+# Libraries present on RutOS but missing from the malta rootfs (QEMU bench only)
+68b576c9e589712a80c0dcef53521aabae406db568462d0f6aa744f33b126562 21.02.0/packages/mips_24kc/packages/libsqlite3-0_3400000-1_mips_24kc.ipk
+baba59921479fbfd25e244f68f9e1187b0244529bcb8eadf6f54b730e1c304ca 21.02.0/packages/mips_24kc/base/libopenssl1.1_1.1.1t-2_mips_24kc.ipk
+4f710c2c620f0f9c3c43e663387d71c61a1d05b6f0bb3c09c10b7898dc2174eb 21.02.0/packages/mips_24kc/base/zlib_1.2.11-6_mips_24kc.ipk
