@@ -53,8 +53,6 @@ The RutOS Package Manager refuses the archive on any other firmware version. Oth
 and modems are not supported. The driver depends on the AT behaviour of the EG06-E firmware,
 and the runtime depends on the RutOS 7.14.5 system libraries.
 
-The gateway has been tested with French and Algerian mobile operators, with and without VoLTE.
-
 ## Quick start
 
 1. Download the WebUI archive `rut360gw_<version>_RUT36X_R_00.07.14.5.tar.gz` from the releases
