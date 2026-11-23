@@ -9,6 +9,21 @@ It is built on **Asterisk 18** (a reduced runtime embedded in the package and ex
 and a patched **chan_quectel** driver that coexists with the RutOS modem manager (`gsmd`)
 instead of taking the modem over.
 
+## Modem driver
+
+The driver changes are developed together with this gateway and published in the
+**[yasserboutaleb/asterisk-chan-quectel](https://github.com/yasserboutaleb/asterisk-chan-quectel)** fork, so
+that other projects can use them without the rest of the package. The fork adds a *shared-module mode*
+(`sms`, `shared_cfg`, `urc_cfg` and `clcc_poll` options: the module stays managed by another program)
+and the call handling fixes found while running this gateway (refused hang-ups, call tracking by polling,
+voice enabled again after a crash, reused call index, device lock, module reset). See its README.
+
+In this repository the driver is vendored unmodified in [`third_party/chan_quectel`](third_party/chan_quectel)
+(upstream revision `5552c365`), and every change lives in one patch,
+[`patches/0001-chan_quectel-rutos-coexistence.patch`](patches/0001-chan_quectel-rutos-coexistence.patch), applied at build
+time. The fork carries the same code as separate commits; it is updated with each release of the gateway
+(see [`third_party/UPSTREAM.md`](third_party/UPSTREAM.md)).
+
 ## Features
 
 - **Voice calls in both directions** between the mobile network (VoLTE, or 3G/2G fallback) and SIP.
@@ -94,7 +109,8 @@ Asterisk 18 and OpenWrt 21.02 are end-of-life upstream. See [docs/SECURITY.md](d
 ## Licence
 
 GPL-2.0-only, like chan_quectel and Asterisk. The chan_quectel sources come from the
-`asterisk-chan-quectel` project (chan_dongle lineage), with a patch for RutOS coexistence.
+`asterisk-chan-quectel` project (chan_dongle lineage, archived upstream), maintained in the
+[fork above](https://github.com/yasserboutaleb/asterisk-chan-quectel).
 
 ## Disclaimer
 
