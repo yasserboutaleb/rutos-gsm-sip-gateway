@@ -206,6 +206,7 @@ call)
 		[ -z "$server_extension" ] || ok_ext "$server_extension" || reply_error "invalid extension (letters, digits, _ + -)"
 		[ -z "$server_local_address" ] || ok_ipv4 "$server_local_address" || reply_error "invalid gateway VPN address (IPv4)"
 		[ -z "$local_username" ] || ok_user "$local_username" || reply_error "invalid LAN SIP username (letters, digits, _ . -; 1 to 32)"
+		case "$local_username" in global|transport-udp|local-auth|server|server-*) reply_error "LAN SIP username reserved by the gateway: $local_username" ;; esac
 		[ -z "$local_password" ] || ok_pass "$local_password" || reply_error "invalid LAN SIP password (8 to 64 characters, no spaces)"
 		[ -z "$local_disable" ] || ok_bool "$local_disable" || reply_error "invalid value: local_disable"
 		uci -q get rut360gw.server >/dev/null || uci set rut360gw.server=server

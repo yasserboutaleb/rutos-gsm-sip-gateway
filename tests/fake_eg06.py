@@ -35,6 +35,8 @@ Scenario control: FIFO file given as argument, one command per line:
                        next to the log: it survives the simulator restart when the driver closes
                        and reopens the port. When restarted with refusals pending, the simulator
                        also echoes commands until ATE0
+    urc on|off         URC mode, like an EC25 in URC mode: RING and +QIND "ccinfo" on every
+                       change of call state; the "dialing" URC is sent BEFORE the OK of ATD
 Log of every command received: argument 2 (file).
 """
 import os
@@ -47,7 +49,8 @@ CTRL, LOG = sys.argv[1], sys.argv[2]
 calls = {}  # idx -> dict(dir, stat, num, visible_at, sticky)
 refuse = {"n": 0, "mode": "qhup"}  # hangups to refuse (refuse_hangup control command)
 delay = {"s": 0.0, "sticky": False}  # listing delay of the next outgoing call (list_delay)
-log = open(LOG, "a", buffering=1)
+urc = {"on": False}  # URC mode (EC25): +QIND "ccinfo" on every change of call state
+log =open(LOG, "a", buffering=1)
 QPCMV_REFUSE = os.path.join(os.path.dirname(os.path.abspath(LOG)), "qpcmv_refuse")
 AUDIO_STALL = os.path.join(os.path.dirname(os.path.abspath(LOG)), "audio_stall")
 
@@ -125,6 +128,21 @@ def visible(c):
     return c.get("visible_at", 0.0) <= time.time()
 
 
+def ccinfo(idx, c, stat=None):
+    """URC mode: +QIND "ccinfo",<idx>,<dir>,<state>,<mode>,<mpty>,<number>,<type> (state -1: call ended)."""
+    if urc["on"]:
+        s = c["stat"] if stat is None else stat
+        out('\r\n+QIND: "ccinfo",%d,%d,%d,0,0,"%s",145\r\n' % (idx, c["dir"], s, c["num"]))
+        log.write("%.3f URC ccinfo %d %d\n" % (time.time(), idx, s))
+
+
+def end_calls(keep=None):
+    """Releases the calls (except index keep), with the end URC in URC mode."""
+    for idx in [i for i in calls if i != keep]:
+        ccinfo(idx, calls[idx], -1)
+        del calls[idx]
+
+
 def clcc_lines():
     lines = list(IMS_LINES)
     for idx, c in sorted(calls.items()):
@@ -141,7 +159,7 @@ def hangup(u):
         if refuse["mode"] == "qhup":
             return reply(final="+CME ERROR: operation not allowed")
         if refuse["mode"] == "gone":
-            calls.clear()
+            end_calls()
         return reply(final="ERROR")
     # call being set up (list_delay sticky): the modem refuses to hang it up
     if any(c.get("sticky") and not visible(c) for c in calls.values()):
@@ -151,10 +169,13 @@ def hangup(u):
         idx = int(m.group(1)) if m else -1
         if idx not in calls:
             return reply(final="+CME ERROR: operation not allowed")  # unknown index or data
+        reply()
+        ccinfo(idx, calls[idx], -1)
         del calls[idx]
-        return reply()
-    calls.clear()
-    return reply()
+        return None
+    reply()
+    end_calls()
+    return None
 
 
 def handle(cmd):
@@ -171,10 +192,12 @@ def handle(cmd):
     if u == "AT+CLCC":
         return reply(clcc_lines())
     if u == "ATA":
-        for c in calls.values():
+        reply()
+        for idx, c in calls.items():
             if c["dir"] == 1 and c["stat"] == 4:
                 c["stat"] = 0
-        return reply()
+                ccinfo(idx, c)
+        return None
     if u.startswith("ATD"):
         num = cmd[3:].rstrip(";")
         if num.startswith("000"):
@@ -186,8 +209,11 @@ def handle(cmd):
         calls[VOICE_BASE] = {"dir": 0, "stat": 2, "num": num,
                              "visible_at": time.time() + delay["s"], "sticky": delay["sticky"]}
         delay["s"], delay["sticky"] = 0.0, False
+        # URC mode: like the EC25, the "dialing" URC is sent BEFORE the OK of ATD
+        ccinfo(VOICE_BASE, calls[VOICE_BASE])
         reply()
         calls[VOICE_BASE]["stat"] = 3  # alerting as soon as it is listed
+        ccinfo(VOICE_BASE, calls[VOICE_BASE])
         return None
     if u in ("AT+CHUP", "ATH") or u.startswith("AT+QHUP") or u.startswith("AT+CHLD=1"):
         return hangup(u)
@@ -213,12 +239,17 @@ def control(line):
         audio(True)
         time.sleep(0.3)
         out("\r\nNO CARRIER\r\n")
-        calls.clear()
+        end_calls()
     elif parts[0] == "ring":
         audio(False)
         calls[VOICE_BASE] = {"dir": 1, "stat": 4, "num": parts[1] if len(parts) > 1 else "+33600000000"}
+        if urc["on"]:
+            out("\r\nRING\r\n")
+        ccinfo(VOICE_BASE, calls[VOICE_BASE])
     elif parts[0] == "remote_hangup":
-        calls.clear()
+        end_calls()
+    elif parts[0] == "urc":
+        urc["on"] = len(parts) > 1 and parts[1] == "on"
     elif parts[0] == "refuse_hangup":
         refuse["n"] = int(parts[1]) if len(parts) > 1 else 1
         refuse["mode"] = parts[2] if len(parts) > 2 else "qhup"
@@ -233,9 +264,10 @@ def control(line):
     elif parts[0] == "dump":
         log.write("%.3f CALLS %d\n" % (time.time(), len(calls)))
     elif parts[0] == "answer_remote":
-        for c in calls.values():
+        for idx, c in calls.items():
             if c["dir"] == 0:
                 c["stat"] = 0
+                ccinfo(idx, c)
 
 
 def main():

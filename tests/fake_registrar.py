@@ -7,9 +7,11 @@ PBX, with the account given as argument. Logs every request received to the log 
     INVITE ruri=<...> from=<...> pai=<...>  (answers 100 then 486 Busy Here)
     MESSAGE-401 / MESSAGE-200 ruri=<...> from=<...> body=<...>
     OPTIONS                                  (answers 200)
+    RESPONSE <code reason> cseq=<...>        (response from the gateway to a request sent below)
 Control: FIFO file, one command per line:
-    invite <number>   sends an INVITE to the registered contact (call from the softphone to GSM)
-    cancel            cancels that INVITE
+    invite <number>          sends an INVITE to the registered contact (call from the softphone to GSM)
+    cancel                   cancels that INVITE
+    message <number> <text>  sends a MESSAGE to the registered contact (SMS from the softphone)
 
     python3 fake_registrar.py <port> <user> <password> <log> <fifo>
 """
@@ -100,6 +102,24 @@ def send_invite(num):
     w("INVITE-OUT ruri=%s" % ruri)
 
 
+def send_message(num, text):
+    if not state["contact"]:
+        w("MESSAGE-OUT impossible: no registered contact")
+        return
+    # same request URI as an INVITE: the line parameter attributes it to the server endpoint
+    m = re.search(r"sip:(?:[^@>;]+@)?([^>;]+)([^>]*)", state["contact"])
+    ruri = "sip:%s@%s" % (num, m.group(1))
+    line = re.search(r";line=([^;>]+)", m.group(2))
+    if line:
+        ruri += ";line=" + line.group(1)
+    msg = ("MESSAGE %s SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:%d;branch=z9hG4bK%x;rport\r\n"
+           "From: <sip:105@127.0.0.1>;tag=f%x\r\nTo: <%s>\r\nCall-ID: bench%x\r\nCSeq: 1 MESSAGE\r\n"
+           "Max-Forwards: 70\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s") % (
+        ruri, PORT, random.getrandbits(48), random.getrandbits(32), ruri, random.getrandbits(48), len(text), text)
+    sock.sendto(msg.encode(), state["peer"])
+    w("MESSAGE-OUT ruri=%s" % ruri)
+
+
 def send_cancel():
     if not state["invite"]:
         return
@@ -111,7 +131,7 @@ def send_cancel():
 def handle(data, addr):
     first, hdr, lines, body = parse(data)
     if first.startswith("SIP/2.0"):
-        w("RESPONSE %s" % first[8:])
+        w("RESPONSE %s cseq=%s" % (first[8:], hdr.get("cseq", "")))
         if first[8:11] in ("180", "183", "200", "486", "487") and state["invite"] and "INVITE" in hdr.get("cseq", ""):
             if first[8:11] == "200" or int(first[8:11]) >= 300:
                 ruri, base = state["invite"]
@@ -159,6 +179,8 @@ def main():
                     send_invite(parts[1] if len(parts) > 1 else "0612345690")
                 elif parts and parts[0] == "cancel":
                     send_cancel()
+                elif parts and parts[0] == "message":
+                    send_message(parts[1] if len(parts) > 1 else "0612345690", " ".join(parts[2:]) or "bonjour")
 
 
 if __name__ == "__main__":

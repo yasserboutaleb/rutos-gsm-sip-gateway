@@ -129,6 +129,13 @@ chroot $R /usr/bin/env RUT360GW_AUDIO_TTY=/dev/ttyUSB1 RUT360GW_DATA_TTY=/dev/tt
 check "forbidden value (data_if=2) rejected" "grep -q forbidden /res/refus.out && grep -q 'rc=1' /res/refus.out"
 cp /tmp/uci.bak $R/etc/config/rut360gw
 check "previous configuration kept after a rejection" "grep -q '^data = /dev/ttyUSB3' $G/quectel.conf"
+# local.username names the LAN client's PJSIP endpoint and AOR: one of the gateway's own section
+# names is rejected
+sed -i "s/option username 'test'/option username 'server-reg'/" $R/etc/config/rut360gw
+chroot $R /usr/bin/env RUT360GW_AUDIO_TTY=/dev/ttyUSB1 RUT360GW_DATA_TTY=/dev/ttyUSB3 /bin/sh $P/usr/sbin/rut360gw-config generate >/res/refus-user.out 2>&1; echo "rc=$?" >> /res/refus-user.out
+check "local.username equal to a gateway section (server-reg) rejected" "grep -q 'reserved name' /res/refus-user.out && grep -q 'rc=1' /res/refus-user.out"
+cp /tmp/uci.bak $R/etc/config/rut360gw
+check "LAN client named after its username: endpoint, AOR, SMS destination and incoming calls" "[ \$(grep -c '^\[test\]' $G/pjsip.conf) -eq 2 ] && grep -q '^aors = test' $G/pjsip.conf && grep -q 'MessageSend(pjsip:test,' $G/extensions.conf && ! grep -q linphone $G/pjsip.conf $G/extensions.conf"
 # legacy vps section (up to v0.1.1): server in ip mode, as before
 check "vps section taken over in ip mode: server endpoint identified by its address, no registration" "grep -q '^\[server-identify\]' $G/pjsip.conf && grep -q '^match = 10.8.0.1' $G/pjsip.conf && ! grep -q '^\[server-reg\]' $G/pjsip.conf"
 check "incoming GSM calls to the server (gsm_in auto)" "grep -q '^GSM_IN_DIAL = PJSIP/102@server ' $G/extensions.conf"
@@ -152,10 +159,10 @@ EOF2
 gen_srv register 'gw&pass;1' auto
 check "register mode: password containing \";\" rejected" "grep -q 'server.password empty or contains a forbidden character' /res/generate-srv.out"
 gen_srv register 'gw&pass1' both
-check "register mode: registration, gateway account, no identification by address" "grep -q '^\[server-reg\]' $G/pjsip.conf && grep -q '^client_uri = sip:gw@127.0.0.1:5070' $G/pjsip.conf && grep -q '^from_user = gw' $G/pjsip.conf && grep -q '^password = gw&pass1' $G/pjsip.conf && ! grep -q 'identify_by = ip' $G/pjsip.conf"
-check "gsm_in both: server and LAN client ring together" "grep -q '^GSM_IN_DIAL = PJSIP/102@server&PJSIP/linphone ' $G/extensions.conf"
+check "register mode: registration, gateway account, server identified only by its registration line (identify_by = ip, no address)" "grep -q '^\[server-reg\]' $G/pjsip.conf && grep -q '^client_uri = sip:gw@127.0.0.1:5070' $G/pjsip.conf && grep -q '^from_user = gw' $G/pjsip.conf && grep -q '^password = gw&pass1' $G/pjsip.conf && grep -q '^identify_by = ip' $G/pjsip.conf && ! grep -q '^\[server-identify\]' $G/pjsip.conf"
+check "gsm_in both: server and LAN client ring together" "grep -q '^GSM_IN_DIAL = PJSIP/102@server&PJSIP/test ' $G/extensions.conf"
 gen_srv ip 'x' local
-check "ip mode: IPv4 address required, LAN client alone for incoming calls (gsm_in local)" "grep -q '^\[server-identify\]' $G/pjsip.conf && ! grep -q '^\[server-reg\]' $G/pjsip.conf && grep -q '^GSM_IN_DIAL = PJSIP/linphone ' $G/extensions.conf"
+check "ip mode: IPv4 address required, LAN client alone for incoming calls (gsm_in local)" "grep -q '^\[server-identify\]' $G/pjsip.conf && ! grep -q '^\[server-reg\]' $G/pjsip.conf && grep -q '^GSM_IN_DIAL = PJSIP/test ' $G/extensions.conf"
 cp /tmp/uci.bak $R/etc/config/rut360gw
 chroot $R /usr/bin/env RUT360GW_AUDIO_TTY=/dev/ttyUSB1 RUT360GW_DATA_TTY=/dev/ttyUSB3 /bin/sh $P/usr/sbin/rut360gw-config generate > /dev/null 2>&1
 
@@ -252,7 +259,7 @@ echo "127.0.0.1 $(hostname)" >> $R/etc/hosts
 # bench only: dialplan trace ("Executing [...]") in /res/asterisk.out
 sed -i 's/^verbose = .*/verbose = 3/' $G/asterisk.conf
 # RTP timeout: 60 s in the package, reduced to 8 s for the duration of the bench
-check "RTP timeout of 60 s on the server and linphone endpoints" "[ \$(grep -c -E '^rtp_timeout = 60' $G/pjsip.conf) -eq 2 ]"
+check "RTP timeout of 60 s on the server and LAN client endpoints" "[ \$(grep -c -E '^rtp_timeout = 60' $G/pjsip.conf) -eq 2 ]"
 sed -i 's/^rtp_timeout = 60/rtp_timeout = 8/' $G/pjsip.conf
 sed -i 's/^console => .*/&,verbose/' $G/logger.conf
 astrx() { ast -rx "$1" 2>&1; }
@@ -369,9 +376,10 @@ echo "add_call 3 0 0" > /ctrl; sleep 7
 check "active call unknown to the driver (Asterisk restarted during a call): hung up" "[ \$(unknown_count) -gt $u0 ] && grep -q -E 'AT\+QHUP=21,3$' /res/at.log && modem_calls_empty && eg06_free"
 check "never AT+QHUP on a provisional index (31) or a data index (1, 2)" "! grep -q -E 'AT\+QHUP=[0-9]+,(1|2|31)$' /res/at.log"
 
-# ---- SIP: LAN client (linphone endpoint of the GENERATED pjsip.conf, test credentials), loopback
+# ---- SIP: LAN client (endpoint "test" = local.username of the GENERATED pjsip.conf; From, To and
+# Contact carry the username, as a softphone configured as documented), loopback
 astrx 'pjsip show endpoints' > /res/pjsip-endpoints.txt
-check "PJSIP loaded: linphone and server endpoints" "grep -q 'Endpoint:  linphone' /res/pjsip-endpoints.txt && grep -q 'Endpoint:  server' /res/pjsip-endpoints.txt"
+check "PJSIP loaded: LAN client (named after its username) and server endpoints" "grep -q -E 'Endpoint:  test( |/)' /res/pjsip-endpoints.txt && grep -q 'Endpoint:  server' /res/pjsip-endpoints.txt"
 SIPC="python3 /repo/tests/sip_client.py --user test --password testpass"
 $SIPC register > /res/sip-register.out 2>&1
 check "SIP: REGISTER of the local client (digest)" "grep -q 'REGISTER -> 200' /res/sip-register.out"
@@ -391,6 +399,11 @@ wait $SPID; echo "rc=$?" >> /res/sip-call.out
 check "SIP -> GSM: answered (200), then BYE from the SIP client" "grep -q 'INVITE 0612345679 -> 200' /res/sip-call.out && grep -q 'rc=0' /res/sip-call.out"
 sleep 4
 check "SIP -> GSM: GSM call released (CHUP/QHUP)" "[ \$(grep -c -E 'AT\+(CHUP|QHUP)' /res/at.log) -gt $n0 ] && ! astrx 'core show channels concise' | grep -q Quectel/eg06"
+# "&" in the dialled number: before, Dial() received it as is and called a second destination
+# (here a second GSM number). Only the filtered number may be dialled: the call is refused.
+$SIPC call '0612345690&Quectel/eg06/0612345691' --wait 15 > /res/sip-inject.out 2>&1; echo "rc=$?" >> /res/sip-inject.out
+sleep 2
+check "SIP: \"&\" in the dialled number refused, nothing dialled by the modem" "grep -q -E 'INVITE 0612345690&Quectel/eg06/0612345691 -> [3-6][0-9][0-9]' /res/sip-inject.out && ! grep -q -E 'ATD06123456(90|91)' /res/at.log && modem_calls_empty"
 
 # the SIP client vanishes mid-call (remote SIP server, tunnel or softphone lost): without a BYE, the
 # GSM call stayed open. The RTP timeout (8 s on the bench) must hang it up.
@@ -481,6 +494,46 @@ dial_wait 0612345693
 check "register mode: call from the server (registered line) dialed to GSM" "grep -q 'ATD0612345693' /res/at.log"
 echo "cancel" > /ctrl-reg; sleep 4
 check "register mode: call cancelled by the server, line free" "eg06_free && ! astrx 'core show channels concise' | grep -q '^Quectel/eg06'"
+echo "message 0612345695 bonjour" > /ctrl-reg
+for i in $(seq 1 10); do grep -q 'RESPONSE 202 .*MESSAGE' /res/registrar.log && break; sleep 1; done
+check "register mode: MESSAGE from the server (registered line) accepted to the SMS bridge" "grep -q 'RESPONSE 202 .*MESSAGE' /res/registrar.log && grep -a -q '0612345695@sms-out' /res/asterisk.out"
+# a LAN client posing as the server (From: server, no account): before the fix, identified by the
+# user of its From header and treated as the server, without a password (GSM call and SMS)
+SPOOF="python3 /repo/tests/sip_client.py --user server --password wrong --port 5072 --rtp 40020"
+$SPOOF call 0612345694 --wait 10 > /res/sip-spoof.out 2>&1
+$SPOOF message 0612345696 spoof >> /res/sip-spoof.out 2>&1
+sleep 2
+check "register mode: LAN request posing as the server (From: server) refused, no GSM call, no SMS" "grep -q -E 'INVITE 0612345694 -> 40[13]' /res/sip-spoof.out && grep -q -E 'MESSAGE 0612345696 -> 40[13]' /res/sip-spoof.out && ! grep -q 'ATD0612345694' /res/at.log && ! grep -a -q -E '0612345694@from-server|0612345696@sms-out' /res/asterisk.out"
+
+# ---- URC mode, like an EC25 in URC mode (Pi gateway): +QIND "ccinfo" IN ADDITION to AT+CLCC polling
+# The modem sends RING and +QIND "ccinfo"; the "dialing" URC arrives BEFORE the OK of ATD. The driver
+# must attach the call anyway, and never hang up one of its own calls as "unknown".
+astrx 'core stop now' >/dev/null 2>&1
+for i in $(seq 1 30); do astrx 'core show uptime' >/dev/null 2>&1 || break; sleep 1; done
+sed -i -e 's/^urc_cfg *=.*/urc_cfg = on/' $G/quectel.conf
+echo "urc on" > /ctrl
+ast -f > /res/asterisk-urc.out 2>&1 &
+for i in $(seq 1 60); do astrx 'core waitfullybooted' >/dev/null 2>&1 && break; sleep 2; done
+for i in $(seq 1 30); do eg06_free && break; sleep 2; done
+urc_unknown() { grep -a -c 'unknown call idx' /res/asterisk-urc.out; }
+check "URC mode: +QIND ccinfo enabled at start, line free" "grep -q 'AT+QINDCFG=.ccinfo.,1' /res/at.log && eg06_free"
+q0=$(qhup3_count)
+astrx "channel originate Quectel/eg06/0612345690 application Wait 20" >/dev/null
+dial_wait 0612345690; sleep 4
+check "URC mode: ccinfo \"dialing\" before the OK of ATD, call attached, still in progress" "astrx 'core show channels concise' | grep -q '^Quectel/eg06' && grep -q 'URC ccinfo 3 2' /res/at.log && [ \$(urc_unknown) -eq 0 ]"
+echo "answer_remote" > /ctrl; sleep 3
+check "URC mode: answered" "astrx 'core show channels concise' | grep '^Quectel/eg06' | grep -q '!Up!'"
+chan_hangup; t=$(wait_free 10)
+check "URC mode: hung up by its real index, line free, no unknown call (${t} s)" "[ \$(qhup3_count) -gt $q0 ] && eg06_free && [ \$(urc_unknown) -eq 0 ] && modem_calls_empty"
+e0=$(grep -a -c 'Error sending hangup' /res/asterisk-urc.out)
+astrx "channel originate Quectel/eg06/0612345691 application Wait 20" >/dev/null
+dial_wait 0612345691; chan_hangup; t=$(wait_free 10)
+check "URC mode: cancelled at once, hung up without error, line free (${t} s)" "[ \$(grep -a -c 'Error sending hangup' /res/asterisk-urc.out) -eq $e0 ] && eg06_free && modem_calls_empty && [ \$(urc_unknown) -eq 0 ]"
+k0=$(q17_count)
+echo "ring +33612345692" > /ctrl
+for i in $(seq 1 45); do [ "$(q17_count)" -gt "$k0" ] && break; sleep 1; done
+check "URC mode: incoming call (RING + ccinfo) handled, rejected as busy (${i} s)" "[ \$(q17_count) -gt $k0 ] && modem_calls_empty"
+check "URC mode: never AT+QHUP on a provisional (31) or data (1, 2) index" "! grep -q -E 'AT\+QHUP=[0-9]+,(1|2|31)$' /res/at.log"
 
 echo "Result: $PASS PASS / $FAIL FAIL"
 astrx 'core stop now' >/dev/null 2>&1; sleep 2

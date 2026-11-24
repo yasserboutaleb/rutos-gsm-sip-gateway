@@ -1,5 +1,5 @@
 diff --git a/third_party/chan_quectel/src/at_command.c b/third_party/chan_quectel/src/at_command.c
-index c20a8b3..fa205d9 100644
+index c20a8b3..70bfefd 100644
 --- a/third_party/chan_quectel/src/at_command.c
 +++ b/third_party/chan_quectel/src/at_command.c
 @@ -205,6 +205,38 @@ int at_enqueue_initialization(struct cpvt* cpvt)
@@ -112,7 +112,78 @@ index c20a8b3..fa205d9 100644
  /*!
   * \brief Enqueue user-specified command
   * \param cpvt -- cpvt structure
-@@ -1294,6 +1383,25 @@ int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause)
+@@ -1008,6 +1097,29 @@ void at_sms_retrieved(struct cpvt* cpvt, int confirm)
+     pvt->incoming_sms_type  = RES_UNKNOWN;
+ }
+ 
++/*!
++ * \brief Read the next message announced while another one was being read, if any
++ * \param cpvt -- cpvt structure
++ * \note Called once the AT+CMGR command is over (OK or error), not on the +CMGR line: the OK of the
++ * previous command would otherwise be taken for the end of the new read.
++ */
++void at_sms_retrieve_next(struct cpvt* cpvt)
++{
++    struct pvt* const pvt = cpvt->pvt;
++
++    pvt->sms_cmgr_busy = 0;
++    while (pvt->incoming_sms_index < 0 && pvt->pending_sms_count > 0) {
++        const int idx  = pvt->pending_sms_index[0];
++        const int type = pvt->pending_sms_type[0];
++
++        pvt->pending_sms_count--;
++        memmove(pvt->pending_sms_index, pvt->pending_sms_index + 1, pvt->pending_sms_count * sizeof(pvt->pending_sms_index[0]));
++        memmove(pvt->pending_sms_type, pvt->pending_sms_type + 1, pvt->pending_sms_count * sizeof(pvt->pending_sms_type[0]));
++
++        at_enqueue_retrieve_sms(cpvt, idx, type);
++    }
++}
++
+ int at_enqueue_list_messages(struct cpvt* cpvt, enum msg_status_t stat)
+ {
+     DECLARE_AT_CMDNT(cmgl, "+CMGL=%d");
+@@ -1040,9 +1152,29 @@ int at_enqueue_retrieve_sms(struct cpvt* cpvt, int idx, int sms_type)
+     struct pvt* const pvt = cpvt->pvt;
+     at_queue_cmd_t cmd    = ATQ_CMD_DECLARE_DYN(CMD_AT_CMGR);
+ 
+-    /* check if message is already being received */
+-    if (pvt->incoming_sms_index >= 0) {
+-        ast_debug(4, "[%s] SMS retrieve of [%d] already in progress\n", PVT_ID(pvt), pvt->incoming_sms_index);
++    /*
++     * another message is being read: remember this one and read it next (at_sms_retrieve_next).
++     * Before, it was dropped and only read at the next start of the device, e.g. the second part
++     * of a long SMS announced right after the first one. Until the end of the AT+CMGR command: a
++     * read started between the +CMGR line and its OK was taken for the previous one and deleted.
++     */
++    if (pvt->incoming_sms_index >= 0 || pvt->sms_cmgr_busy) {
++        if (idx == pvt->incoming_sms_index) {
++            return 0;
++        }
++        for (unsigned int i = 0; i < pvt->pending_sms_count; ++i) {
++            if (pvt->pending_sms_index[i] == idx) {
++                return 0;
++            }
++        }
++        if (pvt->pending_sms_count >= ARRAY_LEN(pvt->pending_sms_index)) {
++            ast_log(LOG_WARNING, "[%s][SMS:%d] Too many messages waiting, read at the next start\n", PVT_ID(pvt), idx);
++            return 0;
++        }
++        pvt->pending_sms_index[pvt->pending_sms_count] = idx;
++        pvt->pending_sms_type[pvt->pending_sms_count]  = sms_type;
++        pvt->pending_sms_count++;
++        ast_debug(2, "[%s][SMS:%d] Message [%d] being read, read next\n", PVT_ID(pvt), idx, pvt->incoming_sms_index);
+         return 0;
+     }
+ 
+@@ -1059,6 +1191,7 @@ int at_enqueue_retrieve_sms(struct cpvt* cpvt, int idx, int sms_type)
+         goto error;
+     }
+ 
++    pvt->sms_cmgr_busy = 1;
+     return 0;
+ 
+ error:
+@@ -1294,6 +1427,25 @@ int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause)
  {
      struct pvt* const pvt = cpvt->pvt;
  
@@ -138,7 +209,7 @@ index c20a8b3..fa205d9 100644
      if (cpvt == &pvt->sys_chan || CPVT_DIR_INCOMING(cpvt) || (cpvt->state != CALL_STATE_INIT && cpvt->state != CALL_STATE_DIALING)) {
          /* FIXME: other channels may be in RELEASED or INIT state */
          if (PVT_STATE(pvt, chansno) > 1) {
-@@ -1316,6 +1424,45 @@ int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause)
+@@ -1316,6 +1468,45 @@ int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause)
      }
  }
  
@@ -185,7 +256,7 @@ index c20a8b3..fa205d9 100644
   * \brief Enqueue AT+CLVL commands for volume synchronization
   * \param cpvt -- cpvt structure
 diff --git a/third_party/chan_quectel/src/at_command.h b/third_party/chan_quectel/src/at_command.h
-index 4e7e194..04bb48e 100644
+index 4e7e194..fa3dd24 100644
 --- a/third_party/chan_quectel/src/at_command.h
 +++ b/third_party/chan_quectel/src/at_command.h
 @@ -139,6 +139,7 @@ int at_enqueue_initialization_simcom(struct cpvt*);
@@ -196,7 +267,12 @@ index 4e7e194..04bb48e 100644
  int at_enqueue_cspn_cops(struct cpvt* cpvt);
  int at_enqueue_qspn_qnwinfo(struct cpvt* cpvt);
  int at_enqueue_sms(struct cpvt* cpvt, const char* sca, const char* destination, const char* msg, unsigned validity_min, int report_req);
-@@ -156,6 +157,8 @@ int at_enqueue_cmgd(struct cpvt* cpvt, unsigned int index, int delflag);
+@@ -152,10 +153,13 @@ int at_enqueue_user_cmd(struct cpvt* cpvt, const char* input);
+ int at_enqueue_list_messages(struct cpvt* cpvt, enum msg_status_t stat);
+ int at_enqueue_retrieve_sms(struct cpvt* cpvt, int idx, int sms_type);
+ void at_sms_retrieved(struct cpvt* cpvt, int confirm);
++void at_sms_retrieve_next(struct cpvt* cpvt);
+ int at_enqueue_cmgd(struct cpvt* cpvt, unsigned int index, int delflag);
  int at_enqueue_delete_sms(struct cpvt* cpvt, int idx, tristate_bool_t ack);
  int at_enqueue_delete_sms_n(struct cpvt* cpvt, int idx, tristate_bool_t ack);
  int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause);
@@ -206,7 +282,7 @@ index 4e7e194..04bb48e 100644
  int at_enqueue_clcc(struct cpvt* cpvt);
  int at_enqueue_activate(struct cpvt* cpvt);
 diff --git a/third_party/chan_quectel/src/at_response.c b/third_party/chan_quectel/src/at_response.c
-index 71c488c..ddb18c6 100644
+index 71c488c..4b003ab 100644
 --- a/third_party/chan_quectel/src/at_response.c
 +++ b/third_party/chan_quectel/src/at_response.c
 @@ -60,6 +60,8 @@ static const at_response_t at_responses_list[] = {
@@ -275,7 +351,15 @@ index 71c488c..ddb18c6 100644
              pvt->dialing = 1;
              cpvt_change_state(task->cpvt, CALL_STATE_DIALING, 0);
          /* fall through */
-@@ -663,10 +685,24 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
+@@ -397,6 +419,7 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
+         case CMD_AT_CMGR:
+             at_ok_response_dbg(3, pvt, ecmd, NULL);
+             at_sms_retrieved(&pvt->sys_chan, 1);
++            at_sms_retrieve_next(&pvt->sys_chan);
+             break;
+ 
+         case CMD_AT_CMGD:
+@@ -663,10 +686,24 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
  
          case CMD_AT_DSCI_OFF:
              at_err_response_dbg(CONF_SHARED(pvt, dsci) ? 4 : 1, pvt, ecmd, "Error disabling indications");
@@ -301,7 +385,7 @@ index 71c488c..ddb18c6 100644
              break;
  
          case CMD_AT_CPCMREG:
-@@ -716,7 +752,9 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
+@@ -716,7 +753,9 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
              /* fall through */
          case CMD_AT_D:
              at_err_response_err(pvt, ecmd, "Dial failed");
@@ -312,7 +396,7 @@ index 71c488c..ddb18c6 100644
              break;
  
          case CMD_AT_CPCMREG1:
-@@ -735,7 +773,13 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
+@@ -735,13 +774,20 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
          case CMD_AT_CHUP:
          case CMD_AT_QHUP:
          case CMD_AT_CHLD_1x:
@@ -327,7 +411,14 @@ index 71c488c..ddb18c6 100644
              break;
  
          case CMD_AT_CMGR:
-@@ -812,10 +856,12 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
+             // log_cmd_response(LOG_ERROR, pvt, ecmd, "Error reading SMS message, resetting index");
+             at_err_response_dbg(1, pvt, ecmd, "[SMS:%d] Fail to read message", pvt->incoming_sms_index);
+             at_sms_retrieved(&pvt->sys_chan, 0);
++            at_sms_retrieve_next(&pvt->sys_chan);
+             break;
+ 
+         case CMD_AT_CMGD:
+@@ -812,10 +858,12 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
  
          case CMD_AT_QPCMV_TTY:
              at_err_response_wrn(pvt, ecmd, "Cannot enable audio on serial port");
@@ -340,7 +431,7 @@ index 71c488c..ddb18c6 100644
              break;
  
          case CMD_AT_QTONEDET_0:
-@@ -920,7 +966,7 @@ static int start_pbx(struct pvt* const pvt, const char* const number, const int
+@@ -920,7 +968,7 @@ static int start_pbx(struct pvt* const pvt, const char* const number, const int
  
      struct cpvt* const cpvt = ast_channel_tech_pvt(channel);
      // FIXME: not execute if channel_new() failed
@@ -349,7 +440,7 @@ index 71c488c..ddb18c6 100644
  
      /* ast_pbx_start() usually failed if asterisk.conf minmemfree
       * set too low, try drop buffer cache
-@@ -939,21 +985,59 @@ static int start_pbx(struct pvt* const pvt, const char* const number, const int
+@@ -939,21 +987,59 @@ static int start_pbx(struct pvt* const pvt, const char* const number, const int
      return 0;
  }
  
@@ -412,23 +503,26 @@ index 71c488c..ddb18c6 100644
          if (mpty) {
              if (CONF_SHARED(pvt, multiparty)) {
                  if (mpty > 0) {
-@@ -974,10 +1058,14 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
+@@ -974,10 +1060,17 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
              process_state = cpvt_change_state(cpvt, state, 0);
          }
      } else {
 +        const int polling = CONF_SHARED(pvt, clcc_poll) > 0;
++        /* RUT360: from an AT+CLCC response (the poll), not from a +QIND "ccinfo" URC. A URC may come
++         * before the OK of ATD, and is never used to declare a call unknown: the next poll decides. */
++        const int from_poll = polling && pvt->clcc_parsing;
 +
          switch (state) {
              case CALL_STATE_DIALING:
              case CALL_STATE_ALERTING:
 -                cpvt = pvt_channel_find_last_initialized(pvt);
-+                /* RUT360: with AT+CLCC polling, only an outgoing call whose ATD was answered and that
-+                 * the modem has not listed yet can be this one (pvt_channel_find_unlisted_outgoing) */
-+                cpvt = polling ? pvt_channel_find_unlisted_outgoing(pvt) : pvt_channel_find_last_initialized(pvt);
++                /* RUT360: with AT+CLCC polling, only an outgoing call the modem has not listed yet can be
++                 * this one (pvt_channel_find_unlisted_outgoing) */
++                cpvt = polling ? pvt_channel_find_unlisted_outgoing(pvt, !from_poll) : pvt_channel_find_last_initialized(pvt);
  
                  if (mpty) {
                      if (!CONF_SHARED(pvt, multiparty)) {
-@@ -988,14 +1076,45 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
+@@ -988,14 +1081,49 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
                  }
  
                  if (cpvt) {
@@ -452,7 +546,9 @@ index 71c488c..ddb18c6 100644
 +                        at_enqueue_hangup(cpvt, cpvt->call_idx, AST_CAUSE_NORMAL_CLEARING);
 +                    }
 +                } else if (polling) {
-+                    clcc_unknown_add(pvt, call_idx, state);
++                    if (from_poll) {
++                        clcc_unknown_add(pvt, call_idx, state);
++                    }
 +                    process_state = 0;
                  } else {
                      at_enqueue_hangup(&pvt->sys_chan, call_idx, AST_CAUSE_CALL_REJECTED);
@@ -466,7 +562,9 @@ index 71c488c..ddb18c6 100644
 +                /* RUT360: an active or held call the driver does not know (released too early, or answered
 +                 * by someone else): nobody is on the SIP side, it is hung up by clcc_poll_unknown() */
 +                if (polling) {
-+                    clcc_unknown_add(pvt, call_idx, state);
++                    if (from_poll) {
++                        clcc_unknown_add(pvt, call_idx, state);
++                    }
 +                    process_state = 0;
 +                }
 +                break;
@@ -476,7 +574,7 @@ index 71c488c..ddb18c6 100644
          }
      }
  
-@@ -1141,8 +1260,11 @@ static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const r
+@@ -1141,8 +1269,11 @@ static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const r
      }
  
      struct cpvt* cpvt;
@@ -490,7 +588,7 @@ index 71c488c..ddb18c6 100644
      }
  
      RAII_VAR(struct ast_str*, line, ast_str_create(LINE_DEF_LEN), ast_free);
-@@ -1162,17 +1284,244 @@ static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const r
+@@ -1162,17 +1293,248 @@ static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const r
              continue;
          }
  
@@ -501,12 +599,14 @@ index 71c488c..ddb18c6 100644
          }
  
 +        ++pvt->clcc_nvoice; /* RUT360: voice calls listed by this AT+CLCC (clcc_poll_unknown) */
++        pvt->clcc_parsing = 1u; /* RUT360: tells handle_clcc() that this line comes from AT+CLCC, not a URC */
          handle_clcc(pvt, call_idx, dir, state, mode, mpty ? TRIBOOL_TRUE : TRIBOOL_FALSE, number, type);
-     }
- 
-     return 0;
- }
- 
++        pvt->clcc_parsing = 0u;
++    }
++
++    return 0;
++}
++
 +/*
 + * RUT360: without +QIND "ccinfo" URCs nothing signals a call end, so a call that
 + * is no longer listed by AT+CLCC is released here. Called on the final OK of every
@@ -533,11 +633,11 @@ index 71c488c..ddb18c6 100644
 +        if (task->cpvt == cpvt) {
 +            return 1;
 +        }
-+    }
-+
-+    return 0;
-+}
-+
+     }
+ 
+     return 0;
+ }
+ 
 +static void clcc_poll_sweep(struct pvt* const pvt)
 +{
 +    struct cpvt* cpvt;
@@ -667,7 +767,9 @@ index 71c488c..ddb18c6 100644
 +        const unsigned int listed = pvt->clcc_unknown[idx];
 +
 +        pvt->clcc_unknown[idx] = 0u;
-+        if (!listed) {
++        /* not listed, or known by now: a URC (+QIND "ccinfo") or a later line of the same AT+CLCC may
++         * have given this index to a call of the driver since it was recorded */
++        if (!listed || pvt_channel_find_by_call_idx(pvt, (int)idx)) {
 +            pvt->clcc_unknown_polls[idx] = 0u;
 +            continue;
 +        }
@@ -736,7 +838,7 @@ index 71c488c..ddb18c6 100644
  static unsigned int map_dsci(const unsigned int dsci)
  {
      switch (dsci) {
-@@ -1488,6 +1837,12 @@ static int at_response_cmti(struct pvt* const pvt, const struct ast_str* const r
+@@ -1488,6 +1850,12 @@ static int at_response_cmti(struct pvt* const pvt, const struct ast_str* const r
  {
      int idx;
  
@@ -749,7 +851,7 @@ index 71c488c..ddb18c6 100644
      if (at_parse_cmti(ast_str_buffer(response), &idx)) {
          ast_log(LOG_WARNING, "[%s] Error parsing incoming message alert '%s', ignoring\n", PVT_ID(pvt), ast_str_buffer(response));
          return -1;
-@@ -1520,6 +1875,11 @@ static int at_response_cdsi(struct pvt* const pvt, const struct ast_str* const r
+@@ -1520,6 +1888,11 @@ static int at_response_cdsi(struct pvt* const pvt, const struct ast_str* const r
  {
      int idx;
  
@@ -761,7 +863,7 @@ index 71c488c..ddb18c6 100644
      if (at_parse_cdsi(ast_str_buffer(response), &idx)) {
          ast_log(LOG_WARNING, "[%s] Error parsing incoming message alert '%s', ignoring\n", PVT_ID(pvt), ast_str_buffer(response));
          return -1;
-@@ -2634,6 +2994,15 @@ static int at_response_psnwid(struct pvt* const pvt, const struct ast_str* const
+@@ -2634,6 +3007,15 @@ static int at_response_psnwid(struct pvt* const pvt, const struct ast_str* const
      }
  
      char utf8_str[50];
@@ -778,7 +880,7 @@ index 71c488c..ddb18c6 100644
          ast_log(LOG_ERROR, "[%s] Error decoding full network name: %s\n", PVT_ID(pvt), fnn);
          return -1;
 diff --git a/third_party/chan_quectel/src/chan_quectel.c b/third_party/chan_quectel/src/chan_quectel.c
-index 195ec39..3316e9f 100644
+index 195ec39..bf1b7a3 100644
 --- a/third_party/chan_quectel/src/chan_quectel.c
 +++ b/third_party/chan_quectel/src/chan_quectel.c
 @@ -177,7 +177,7 @@ void pvt_disconnect(struct pvt* pvt)
@@ -790,7 +892,16 @@ index 195ec39..3316e9f 100644
      pvt->has_voice        = 0;
      pvt->has_call_waiting = 0;
  
-@@ -502,7 +502,11 @@ int pvt_get_pseudo_call_idx(const struct pvt* pvt)
+@@ -192,6 +192,8 @@ void pvt_disconnect(struct pvt* pvt)
+     pvt->outgoing_sms       = 0;
+     pvt->incoming_sms_index = -1;
+     pvt->incoming_sms_type  = RES_UNKNOWN;
++    pvt->pending_sms_count  = 0;
++    pvt->sms_cmgr_busy      = 0;
+     pvt->volume_sync_step   = VOLUME_SYNC_BEGIN;
+ 
+     pvt->current_state = DEV_STATE_STOPPED;
+@@ -502,7 +504,11 @@ int pvt_get_pseudo_call_idx(const struct pvt* pvt)
          SET_BIT(bits, cpvt->call_idx);
      }
  
@@ -803,22 +914,26 @@ index 195ec39..3316e9f 100644
          if (!TEST_BIT(bits, dwords)) {
              return dwords;
          }
-@@ -954,6 +958,25 @@ struct cpvt* pvt_channel_find_last_initialized(struct pvt* pvt)
+@@ -954,6 +960,29 @@ struct cpvt* pvt_channel_find_last_initialized(struct pvt* pvt)
      return res;
  }
  
 +/*
 + * RUT360: the outgoing call a newly listed dialing/alerting call belongs to, with AT+CLCC polling.
-+ * Only a call whose ATD was answered OK (state DIALING) and that the modem has not listed yet
-+ * qualifies: never an active or held call (pvt_channel_find_last_initialized would accept them
-+ * and give them the new index), nor a call whose ATD is still queued (the listed call cannot be it).
++ * Only an outgoing call the modem has not listed yet qualifies, never an active or held call
++ * (pvt_channel_find_last_initialized would accept them and give them the new index).
++ * - From an AT+CLCC response (accept_init = 0): only a call whose ATD was answered OK (DIALING). The
++ *   AT queue is serial, so a call whose ATD is still queued cannot be the listed one.
++ * - From a +QIND "ccinfo" URC (accept_init = 1, modems that send them, e.g. the EC25 of the Pi
++ *   gateway): the URC may arrive before the OK of ATD, so a call still in INIT qualifies too.
 + */
-+struct cpvt* pvt_channel_find_unlisted_outgoing(struct pvt* pvt)
++struct cpvt* pvt_channel_find_unlisted_outgoing(struct pvt* pvt, int accept_init)
 +{
 +    struct cpvt* cpvt;
 +
 +    AST_LIST_TRAVERSE(&pvt->chans, cpvt, entry) {
-+        if (CPVT_DIR_OUTGOING(cpvt) && cpvt->state == CALL_STATE_DIALING && !CPVT_TEST_FLAG(cpvt, CALL_FLAG_IDX_KNOWN)) {
++        if (CPVT_DIR_OUTGOING(cpvt) && !CPVT_TEST_FLAG(cpvt, CALL_FLAG_IDX_KNOWN) &&
++            (cpvt->state == CALL_STATE_DIALING || (accept_init && cpvt->state == CALL_STATE_INIT))) {
 +            return cpvt;
 +        }
 +    }
@@ -829,7 +944,7 @@ index 195ec39..3316e9f 100644
  #/* */
  
  static const char* pvt_state_base(const struct pvt* const pvt)
-@@ -968,6 +991,8 @@ static const char* pvt_state_base(const struct pvt* const pvt)
+@@ -968,6 +997,8 @@ static const char* pvt_state_base(const struct pvt* const pvt)
          state = "Not initialized";
      } else if (!pvt->gsm_registered) {
          state = "GSM not registered";
@@ -838,7 +953,7 @@ index 195ec39..3316e9f 100644
      }
      return state;
  }
-@@ -1130,7 +1155,7 @@ static struct pvt* pvt_create(const pvt_config_t* settings)
+@@ -1130,9 +1161,11 @@ static struct pvt* pvt_create(const pvt_config_t* settings)
      pvt->audio_fd           = -1;
      pvt->data_fd            = -1;
      pvt->gsm_reg_status     = -1;
@@ -846,16 +961,34 @@ index 195ec39..3316e9f 100644
 +    pvt->has_sms            = (SCONFIG(settings, msg_direct) || !SCONFIG(settings, sms)) ? 0 : 1;
      pvt->incoming_sms_index = -1;
      pvt->incoming_sms_type  = RES_UNKNOWN;
++    pvt->pending_sms_count  = 0;
++    pvt->sms_cmgr_busy      = 0;
      pvt->desired_state      = SCONFIG(settings, init_state);
+ 
+     ast_string_field_init(pvt, 15);
 diff --git a/third_party/chan_quectel/src/chan_quectel.h b/third_party/chan_quectel/src/chan_quectel.h
-index 5e249b1..481c9b4 100644
+index 5e249b1..e7a617a 100644
 --- a/third_party/chan_quectel/src/chan_quectel.h
 +++ b/third_party/chan_quectel/src/chan_quectel.h
-@@ -177,6 +177,14 @@ typedef struct pvt {
+@@ -125,6 +125,12 @@ typedef struct pvt {
+     /* SMS support */
+     int incoming_sms_index;
+     int incoming_sms_type;
++    /* messages announced (+CMTI, +CDSI) while another one was being read: read next, in order */
++    int pending_sms_index[8];
++    int pending_sms_type[8];
++    unsigned int pending_sms_count;
++    /* AT+CMGR sent, its OK or error not received yet (incoming_sms_index is reset on the +CMGR line) */
++    int sms_cmgr_busy;
+ 
+     struct ast_tm module_time;
+ 
+@@ -177,6 +183,15 @@ typedef struct pvt {
      volatile restate_time_t restart_time; /*!< time when change state */
      volatile dev_state_t current_state;   /*!< current state */
  
 +    /* RUT360: AT+CLCC polling (clcc_poll) */
++    unsigned int clcc_parsing;                          /*!< handle_clcc() called from an AT+CLCC response, not from a URC */
 +    unsigned int clcc_nvoice;                           /*!< voice calls listed by the AT+CLCC being processed */
 +    unsigned char clcc_unknown[MAX_CALL_IDX + 1];       /*!< calls unknown to the driver listed by it: call state + 1, 0 = not listed */
 +    unsigned char clcc_unknown_polls[MAX_CALL_IDX + 1]; /*!< consecutive polls listing each unknown call */
@@ -866,11 +999,11 @@ index 5e249b1..481c9b4 100644
      pvt_config_t settings; /*!< all device settings from config file */
      pvt_state_t state;     /*!< state */
      pvt_stat_t stat;       /*!< various statistics */
-@@ -253,6 +261,7 @@ static inline struct pvt* pvt_msg_find_by_resource(const char* resource, unsigne
+@@ -253,6 +268,7 @@ static inline struct pvt* pvt_msg_find_by_resource(const char* resource, unsigne
  struct cpvt* pvt_channel_find_by_call_idx(struct pvt* pvt, int call_idx);
  struct cpvt* pvt_channel_find_active(struct pvt* pvt);
  struct cpvt* pvt_channel_find_last_initialized(struct pvt* pvt);
-+struct cpvt* pvt_channel_find_unlisted_outgoing(struct pvt* pvt);
++struct cpvt* pvt_channel_find_unlisted_outgoing(struct pvt* pvt, int accept_init);
  
  void pvt_unlock(struct pvt* const pvt);
  
@@ -1276,3 +1409,18 @@ index 5df7820..67baafb 100644
                          ast_debug(5, "[%s] Unable to handle timeout\n", dev);
                      }
                      continue;
+diff --git a/third_party/chan_quectel/src/mutils.h b/third_party/chan_quectel/src/mutils.h
+index 4634527..ec9d193 100644
+--- a/third_party/chan_quectel/src/mutils.h
++++ b/third_party/chan_quectel/src/mutils.h
+@@ -19,7 +19,9 @@
+ 
+ static inline const char* enum2str_def(const unsigned value, const char* const names[], const unsigned items, const char* const def)
+ {
+-    return S_COR(value < items, names[value], def);
++    /* bound checked first: S_COR() evaluates names[value] before its condition, which read out of
++       the array for an unset value (-1 before registration) and crashed on 64-bit hosts */
++    return (value < items && !ast_strlen_zero(names[value])) ? names[value] : def;
+ }
+ 
+ static inline const char* enum2str(const unsigned value, const char* const names[], const unsigned items)

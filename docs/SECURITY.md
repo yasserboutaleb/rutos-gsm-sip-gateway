@@ -35,7 +35,8 @@ is touched. Use `rut360gw-fw show` to compare the expected rules with the rules 
 
   The web page generates a random 20-character password.
 - **Remote server**, `register` mode: the gateway accepts requests from the server only on its
-  registered line (the `line` parameter of its `Contact`). Unsolicited requests are rejected.
+  registered line (the `line` parameter of its `Contact`), never on the user of the `From` header
+  (`identify_by = ip`). Unsolicited requests are rejected.
   Use a long random password for the gateway's account and protect the server (fail2ban or
   similar).
 - **Remote server**, `ip` mode: identified by its IP address only, so use it **only over a

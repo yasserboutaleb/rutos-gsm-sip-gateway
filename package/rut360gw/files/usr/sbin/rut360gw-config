@@ -104,10 +104,15 @@ validate() {
 	[ -z "$LAN_NET" ] || echo "$LAN_NET" | grep -q -E '^([0-9]{1,3}.){3}[0-9]{1,3}/[0-9.]+$' || { log "unreadable LAN subnet ($LAN_NET): LAN SIP client access list omitted"; LAN_NET=; }
 	case "$RINGBACK" in local) RINGBACK_OPT=r ;; network) RINGBACK_OPT= ;; *) log "invalid features.ringback (local or network)"; ok=1 ;; esac
 	for v in "$SIP_USER" "$SIP_PASSWORD"; do safe "$v" || { log "forbidden character (| ; \\ or newline) in local.*"; ok=1; }; done
+	# local.username names the PJSIP endpoint and AOR of the LAN client: a section name, not one of ours
+	if [ "$LOCAL_ON" = 1 ]; then
+		echo "$SIP_USER" | grep -q -E '^[A-Za-z0-9_.-]{1,32}$' || { log "invalid local.username (letters, digits, _ . -; 1 to 32)"; ok=1; }
+		case "$SIP_USER" in global|transport-udp|local-auth|server|server-*) log "local.username: reserved name ($SIP_USER)"; ok=1 ;; esac
+	fi
 	# destinations of incoming GSM calls
 	srv=; loc=
 	[ "$SERVER_ON" = 1 ] && srv="PJSIP/$SERVER_EXT@server"
-	[ "$LOCAL_ON" = 1 ] && loc="PJSIP/linphone"
+	[ "$LOCAL_ON" = 1 ] && loc="PJSIP/$SIP_USER"
 	case "$GSM_IN" in
 		auto) GSM_IN_DIAL=${srv:-$loc} ;;
 		server) [ -n "$srv" ] || { log "features.gsm_in=server but the SIP server is disabled"; ok=1; }; GSM_IN_DIAL=$srv ;;

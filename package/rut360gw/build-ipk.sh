@@ -22,7 +22,7 @@ COUNT=$(cd "$HERE" && git rev-list --count HEAD 2>/dev/null || echo 0)
 # Increasing version for opkg: r<commit count>.g<hash>. A hash alone is not ordered
 # (0.1.0-4332d2f < 0.1.0-c18ff8e for opkg: the upgrade was rejected as a "downgrade").
 # The "r" prefix sorts these versions above the older "0.1.0-<hash>" versions.
-VERSION=${VERSION:-0.2.0-r$COUNT.g$GITREV}
+VERSION=${VERSION:-0.2.1-r$COUNT.g$GITREV}
 # runtime version: bump it on EVERY change of its content (otherwise the WebUI considers it up to date)
 RTVER=$(cat "$HERE/../../build/runtime/VERSION")
 EPOCH=${SOURCE_DATE_EPOCH:-$(cd "$HERE" && git log -1 --format=%ct 2>/dev/null || echo 0)}

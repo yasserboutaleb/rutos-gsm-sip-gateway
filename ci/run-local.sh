@@ -58,12 +58,18 @@ fetch)
 	;;
 lint)
 	step "lint"
-	if drun $IMG sh -c '
-		git config --global --add safe.directory /repo; cd /repo; e=0
-		for f in $(git ls-files "*.sh" | grep -v "^third_party/") package/rut360gw/files/etc/init.d/rut360gw $(ls package/rut360gw/files/usr/sbin/* | grep -v rut360gw-sms) package/rut360gw/CONTROL/postinst package/rut360gw/CONTROL/prerm package/rut360gw/CONTROL/postrm package/rut360gw/CONTROL-runtime/preinst package/rut360gw/CONTROL-runtime/postinst package/rut360gw/files/usr/libexec/rpcd/rut360gw; do
+	# list of scripts computed on the host: in a Git worktree, the .git file points to a Windows path
+	# (D:/.../.git/worktrees/...), "git ls-files" fails in the container, the list is empty and the
+	# lint used to pass without checking anything
+	SH_FILES=$(cd "$REPO" && git ls-files "*.sh" | grep -v "^third_party/" | tr '\n' ' ')
+	if [ -z "$SH_FILES" ]; then echo "no .sh script found (git ls-files)"; ko lint; continue; fi
+	echo "$(echo $SH_FILES | wc -w) .sh scripts"
+	if drun -e SH_FILES="$SH_FILES" $IMG sh -c '
+		cd /repo; e=0
+		for f in $SH_FILES package/rut360gw/files/etc/init.d/rut360gw $(ls package/rut360gw/files/usr/sbin/* | grep -v rut360gw-sms) package/rut360gw/CONTROL/postinst package/rut360gw/CONTROL/prerm package/rut360gw/CONTROL/postrm package/rut360gw/CONTROL-runtime/preinst package/rut360gw/CONTROL-runtime/postinst package/rut360gw/files/usr/libexec/rpcd/rut360gw; do
 			sh -n "$f" || { echo "syntax: $f"; e=1; }
 		done
-		shellcheck -S error -s sh $(git ls-files "*.sh" | grep -v "^third_party/" | grep -v "^tests/run-qemu-test.sh") $(ls package/rut360gw/files/usr/sbin/* | grep -v rut360gw-sms) package/rut360gw/files/usr/libexec/rpcd/rut360gw || e=1
+		shellcheck -S error -s sh $(printf "%s\n" $SH_FILES | grep -v "^tests/run-qemu-test.sh$") $(ls package/rut360gw/files/usr/sbin/* | grep -v rut360gw-sms) package/rut360gw/files/usr/libexec/rpcd/rut360gw || e=1
 		shellcheck -S error -s bash tests/run-qemu-test.sh || e=1
 		luac5.1 -p package/rut360gw/files/usr/sbin/rut360gw-sms || e=1
 		python3 -m py_compile tests/fake_eg06.py tests/fake_audio.py tests/fake_registrar.py tests/webui-relay.py tests/sip_client.py build/runtime/assemble.py build/runtime/prune.py || e=1

@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.1: security fix
+
+**Upgrade if the gateway uses a remote SIP server in `register` mode.** In 0.2.0, any host on the
+LAN could pose as the server, without a password, and place GSM calls or send SMS at the SIM's
+expense. `ip` mode and the LAN SIP client alone were not affected. The runtime is unchanged
+(18.15.1-4): the WebUI upgrade reinstalls only `rut360gw`, and the settings are kept.
+
+- **Remote server in `register` mode: spoofing from the LAN.** The `server` endpoint kept Asterisk's
+  default identification (`username,ip`), so a LAN client sending `From: server` was taken for the
+  server, without a password, and could call a GSM number or send an SMS. The server is now
+  identified only by its address (`ip` mode) or by its registration line (`register` mode, the
+  `line` parameter of the registered contact): `identify_by = ip` in both modes. The bench sends a
+  spoofed call and SMS (refused) and an SMS from the real server on its line (accepted).
+- **Only the filtered number reaches `Dial()`.** Calls from the LAN client or the SIP server passed
+  `${EXTEN}` as is: a `&` added a destination and a `,` added options. The call is now refused when
+  the number holds anything but digits and `+`. Only an authenticated caller could do this.
+- **LAN SIP client named after its username.** The endpoint and AOR were called `linphone`, while
+  the documentation has the softphone configured with `local.username` (default `rut360`). Asterisk
+  identifies a client by the user of its From header and registers the AOR of its To header, so a
+  softphone configured as documented matched no endpoint (endless 401). The gateway's own section
+  names (`server*`, `global`, `transport-udp`, `local-auth`) are refused as a username.
+- **Driver: out-of-bounds read in `enum2str_def()`.** Asterisk's `S_COR()` evaluates
+  `names[value]` before its condition, so an unset value (registration state -1 before the module
+  registers) was read about 4 GiB past the array: `quectel show device state` crashed Asterisk on
+  64-bit hosts. On the RUT360 (32-bit MIPS) the address wraps to the word before the array, with no
+  visible effect. The bound is now checked first, for every enum-to-text conversion.
+- **Driver: call state URCs alongside `AT+CLCC` polling.** On a module that also sends
+  `+QIND "ccinfo"` URCs (EC25 in URC mode), the "dialing" URC can arrive before the OK of `ATD`;
+  the poll logic recorded the outgoing call as unknown and hung it up. A URC may now attach a call
+  still being dialled, and only the poll declares a call unknown. No change on the RUT360, whose
+  URCs go to `gsmd`. The bench simulates the URC mode.
+- **Driver: SMS announced while another one is read.** A `+CMTI` received during an `AT+CMGR` was
+  dropped, and the message was only read at the next start of the device (the second part of a long
+  SMS, for example). It is now queued (up to 8) and read once the current read is over. No change
+  on the RUT360, where `sms = off` and RutOS handles SMS.
+- Outgoing SMS and USSD checks compare lengths instead of strings: a `"` in the number broke the
+  expression (harmless, the filtered value was already the one used).
+
+The driver changes are also on the public fork
+[yasserboutaleb/asterisk-chan-quectel](https://github.com/yasserboutaleb/asterisk-chan-quectel)
+(commits `aa4543a`, `6e11254`, `a645433`).
+
 ## 0.2.0: first public release
 
 First public release of `rut360gw`, a GSM/VoLTE <-> SIP gateway for the Teltonika RUT360

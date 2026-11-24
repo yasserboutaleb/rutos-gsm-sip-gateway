@@ -23,7 +23,10 @@ This directory is **not modified**: the RUT360/RutOS adaptations live in `../pat
 | `96a8f4d` | call index reused by the module for a new incoming call |
 | `d50181e` | call revalidated under the device lock; init retried when `AT+QPCMV?` is refused; missing `break` |
 | `558253d`, `82f1213` | neutral comments; README lists the fixes and what was tested |
+| `aa4543a`, `3ee2fd6` | `+QIND "ccinfo"` URCs coexist with `AT+CLCC` polling (EC25 in URC mode) |
+| `6e11254` | bound checked before reading a state name (`S_COR()` read out of the array, crash on 64-bit hosts) |
+| `a645433` | SMS announced (`+CMTI`) while another one is read: queued and read next, instead of dropped |
 
-The code is identical to `patches/0001-chan_quectel-rutos-coexistence.patch` of release 0.2.0; only the comments differ.
+The code is identical to `patches/0001-chan_quectel-rutos-coexistence.patch` (after release 0.2.0); only the comments differ.
 
 **Keeping the fork in step.** Each release that changes the patch also updates the fork: rebuild the patched tree of each patch version on top of `5552c36`, replay those versions onto the fork with three-way merges (conflicts are comment-only: keep the new code, keep the fork's neutral comment style), check that the code matches the patch line for line outside comments, update the fork README, then push `master`.
