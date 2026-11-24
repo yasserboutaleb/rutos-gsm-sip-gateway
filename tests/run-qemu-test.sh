@@ -198,6 +198,14 @@ fw apply > /res/fw-apply2.out
 check "firewall: nothing to do when the rules are already in place" "! grep -q 'rules updated' /res/fw-apply2.out"
 us set rut360gw.features.lan_sip_limit=0; us commit rut360gw; fw apply > /dev/null
 check "firewall: lan_sip_limit=0, no more limit (anti-spoofing kept)" '[ -z "$(ug firewall.rut360gw_sip_lan)" ] && [ -z "$(ug firewall.rut360gw_sip_lan_drop)" ] && [ -n "$(ug firewall.rut360gw_antispoof)" ]'
+# hardened LAN (input REJECT): the limit rule ACCEPTs SIP, it would open UDP 5060 there; never added
+us set rut360gw.features.lan_sip_limit=20; us commit rut360gw; fw apply > /dev/null
+us set firewall.@zone[0].input=REJECT; us commit firewall; fw apply > /res/fw-apply3.out
+check "firewall: lan zone rejecting its input, limit rules removed (UDP 5060 not opened), anti-spoofing kept, warning for the LAN client" '[ -z "$(ug firewall.rut360gw_sip_lan)" ] && [ -z "$(ug firewall.rut360gw_sip_lan_drop)" ] && [ -n "$(ug firewall.rut360gw_antispoof)" ] && grep -q "SIP from the LAN left to the zone" /res/fw-apply3.out && grep -q "LAN SIP client is reachable only" /res/fw-apply3.out'
+us delete firewall.@zone[0].input; us set firewall.@defaults[0].input=DROP; us commit firewall; fw apply > /dev/null
+check "firewall: lan zone without input policy, firewall default DROP: UDP 5060 not opened" '[ -z "$(ug firewall.rut360gw_sip_lan)" ] && [ -n "$(ug firewall.rut360gw_antispoof)" ]'
+us set firewall.@zone[0].input=ACCEPT; us set firewall.@defaults[0].input=ACCEPT; us commit firewall; fw apply > /res/fw-apply4.out
+check "firewall: lan zone accepting its input again, SIP limit back, no warning" '[ "$(ug firewall.rut360gw_sip_lan.limit)" = 20/sec ] && [ "$(ug firewall.rut360gw_sip_lan_drop.target)" = DROP ] && ! grep -q "reachable only" /res/fw-apply4.out'
 fw remove > /dev/null
 check "firewall: remove deletes our rules, and only ours" '[ -z "$(ug firewall.rut360gw_antispoof)" ] && [ "$(ug firewall.autre.name)" = "regle existante" ]'
 cp /tmp/uci.bak $R/etc/config/rut360gw

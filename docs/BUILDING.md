@@ -152,7 +152,7 @@ It uses:
 Scenarios covered include:
 
 - installation and configuration generation in both modes, including refused values;
-- firewall rules: order, idempotence, `lan_sip_limit=0`, removal;
+- firewall rules: order, idempotence, `lan_sip_limit=0`, a `lan` zone that rejects its input (UDP 5060 left closed), removal;
 - the LAN client access list;
 - the RTP timeout;
 - busy rejection of incoming calls;

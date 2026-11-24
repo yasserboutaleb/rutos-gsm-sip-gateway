@@ -226,7 +226,7 @@ Serial ports are found by USB interface number, not by `ttyUSBn` name. Check the
 | Option | Default | Meaning |
 |---|---|---|
 | `features.gsm_in` | `auto` | Where incoming GSM calls ring: `server`, `local` (LAN softphone), or `both` (the first to answer takes the call). `auto` = the server if it is enabled, otherwise the LAN softphone. With no destination, incoming calls are rejected as busy. |
-| `features.lan_sip_limit` | `20` | Firewall: at most N SIP packets per second (UDP 5060) from the LAN, with a burst of 2N. The rest is dropped. `0` = no limit. Range 0 to 9999. |
+| `features.lan_sip_limit` | `20` | Firewall: at most N SIP packets per second (UDP 5060) from the LAN, with a burst of 2N. The rest is dropped. `0` = no limit. Range 0 to 9999. Applies only when the `lan` zone accepts its input (RutOS default); a `lan` zone that rejects its input keeps UDP 5060 closed. |
 | `features.sms_bridge` | `1` | SMS <-> SIP bridge. |
 | `features.ussd` | `1` | USSD: `*codes` dialled through the SIP server, and the USSD tab. A USSD request may cut mobile data for about 45 s (2G/3G fallback). |
 | `features.sms_purge` | `1` | SIM purge: an SMS relayed successfully is deleted from the SIM after `sms_purge_delay`. These SMS are never purged automatically: SMS present before installation, SMS that could not be relayed, incomplete SMS. |

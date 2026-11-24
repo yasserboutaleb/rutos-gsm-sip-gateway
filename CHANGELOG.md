@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.2: firewall fix
+
+The runtime is unchanged (18.15.1-4): the WebUI upgrade reinstalls only `rut360gw`, and the settings
+are kept.
+
+- **Firewall: UDP 5060 no longer opened on a closed LAN.** The `rut360gw_sip_lan` rule *accepts*
+  SIP from the LAN up to `features.lan_sip_limit` packets/s. On a `lan` zone that rejects its
+  input (a hardened LAN with untrusted hosts), it opened UDP 5060 to the LAN. It is now added only
+  when the `lan` zone accepts its input (its own policy, otherwise the firewall default); elsewhere
+  SIP from the LAN is left to the zone. A warning is logged at start when the LAN SIP client is
+  enabled on such a zone. The RutOS default (`lan` input `ACCEPT`) is unchanged.
+
 ## 0.2.1: security fix
 
 **Upgrade if the gateway uses a remote SIP server in `register` mode.** In 0.2.0, any host on the

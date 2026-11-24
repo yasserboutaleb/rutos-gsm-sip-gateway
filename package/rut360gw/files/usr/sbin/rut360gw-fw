@@ -2,7 +2,9 @@
 # rut360gw-fw — RutOS firewall rules (fw3, UCI firewall) of the gateway, LAN side:
 #   - SIP rate limit: at most features.lan_sip_limit SIP packets (UDP 5060) per second
 #     from the LAN, the rest is dropped (password guessing, runaway client).
-#     0 = no limit;
+#     0 = no limit. Only when the lan zone accepts its input: the limit rule ACCEPTs SIP up to
+#     the limit, so on a lan zone that rejects its input (hardened LAN, untrusted hosts) it would
+#     open UDP 5060; there, SIP from the LAN is left to the zone;
 #   - anti-spoofing, in ip mode only: the trusted SIP server is identified by its address,
 #     without a password; a packet coming from the LAN with that source address is dropped
 #     (otherwise a LAN device could impersonate the server and place calls).
@@ -19,6 +21,13 @@ P=; [ -x /usr/local/usr/sbin/rut360gw-config ] && P=/usr/local
 log() { logger -t rut360gw-fw "$*"; echo "rut360gw-fw: $*" >&2; }
 get() { v=$(uci -q get "rut360gw.$1"); [ -n "$v" ] && echo "$v" || echo "$2"; }
 RULES="rut360gw_antispoof rut360gw_sip_lan rut360gw_sip_lan_drop"
+# input policy of the lan zone: its own, otherwise the firewall default, otherwise ACCEPT (fw3)
+lan_input() {
+	z=$(uci -q show firewall | sed -n "s/^\(firewall\.[^.]*\)\.name='lan'$/\1/p" | head -n 1)
+	v=; [ -n "$z" ] && v=$(uci -q get "$z.input")
+	[ -n "$v" ] || v=$(uci -q get firewall.@defaults[0].input)
+	echo "${v:-ACCEPT}"
+}
 
 # expected state, one line per option ("section.option=value"), in creation order
 want() {
@@ -33,7 +42,7 @@ want() {
 			"rut360gw_antispoof.src_ip=$host" "rut360gw_antispoof.target=DROP"
 	fi
 	lim=$(get features.lan_sip_limit 20)
-	if [ "$lim" != 0 ]; then
+	if [ "$lim" != 0 ] && [ "$(lan_input)" = ACCEPT ]; then
 		printf '%s\n' "rut360gw_sip_lan=rule" "rut360gw_sip_lan.name=rut360gw: SIP from the LAN, rate limit" \
 			"rut360gw_sip_lan.src=lan" "rut360gw_sip_lan.proto=udp" "rut360gw_sip_lan.dest_port=5060" \
 			"rut360gw_sip_lan.limit=$lim/sec" "rut360gw_sip_lan.limit_burst=$((lim * 2))" "rut360gw_sip_lan.target=ACCEPT" \
@@ -65,12 +74,21 @@ case "${1:-}" in
 	apply)
 		uci -q get firewall.@zone[0] >/dev/null || { log "no firewall configuration: nothing to do"; exit 0; }
 		uci show firewall | grep -q "\.name='lan'" || { log "lan zone missing: rules not added"; exit 0; }
+		in=$(lan_input)
+		# at every start: a LAN client the zone cannot reach is a configuration mistake
+		if [ "$in" != ACCEPT ] && [ -n "$(get local.password '')" ]; then
+			log "warning: the lan zone does not accept its input ($in): the LAN SIP client is reachable only through a firewall rule that accepts UDP 5060 from the LAN"
+		fi
 		w=$(want); h=$(have)
 		[ "$w" = "$h" ] && exit 0
 		remove_rules
 		echo "$w" | while IFS= read -r l; do [ -n "$l" ] && uci set "firewall.$l"; done
 		reload_fw
-		log "LAN rules updated: $(echo "$w" | grep -c '=rule$') rule(s) ($(echo "$w" | grep -q antispoof && echo 'server anti-spoofing, ')SIP limit $(get features.lan_sip_limit 20)/s)"
+		lim=$(get features.lan_sip_limit 20)
+		if echo "$w" | grep -q '^rut360gw_sip_lan=rule$'; then s="SIP limit $lim/s"
+		elif [ "$lim" != 0 ]; then s="no SIP limit: lan zone input $in, SIP from the LAN left to the zone"
+		else s="no SIP limit"; fi
+		log "LAN rules updated: $(echo "$w" | grep -c '=rule$') rule(s) ($(echo "$w" | grep -q antispoof && echo 'server anti-spoofing, ')$s)"
 		;;
 	remove)
 		[ -n "$(have)" ] || exit 0

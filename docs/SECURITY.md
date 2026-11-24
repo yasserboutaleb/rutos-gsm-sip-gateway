@@ -21,7 +21,7 @@ is touched. Use `rut360gw-fw show` to compare the expected rules with the rules 
 | Rule | When | Effect |
 |---|---|---|
 | `rut360gw_antispoof` | `ip` mode, server enabled, `server.host` is an IPv4 address | Drops any packet coming from the **LAN** with the server's address as source. Without it, a LAN device could impersonate the trusted server and place calls. |
-| `rut360gw_sip_lan` | `features.lan_sip_limit` > 0 (default 20) | Accepts SIP (UDP 5060) from the LAN up to N packets/s, with a burst of 2N. |
+| `rut360gw_sip_lan` | `features.lan_sip_limit` > 0 (default 20), and the `lan` zone accepts its input | Accepts SIP (UDP 5060) from the LAN up to N packets/s, with a burst of 2N. Never added when the `lan` zone rejects or drops its input: there it would open UDP 5060, and SIP from the LAN is left to the zone. With the LAN SIP client enabled on such a LAN, the service logs a warning at start: add your own rule if the client must reach the gateway. |
 | `rut360gw_sip_lan_drop` | same | Drops LAN SIP above that limit, which slows password guessing and contains a runaway client. |
 
 ## SIP access control on the gateway
