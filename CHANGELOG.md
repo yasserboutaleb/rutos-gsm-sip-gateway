@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.3: long SMS fix
+
+The runtime is unchanged (18.15.1-4): the WebUI upgrade reinstalls only `rut360gw`, and the settings
+are kept.
+
+- **Long SMS and USSD replies relayed with an empty text.** The bridge handed the whole text to
+  Asterisk in one console command (`asterisk -rx`). The console reads a command in a 512-byte
+  buffer and silently ignores a longer one. Any SMS over about 336 bytes (about 290 Latin
+  characters, or 150 Arabic ones) and any long USSD reply reached the SIP server with an empty text. The
+  relay still counted as a success, so the SMS was then purged from the SIM, and only the RutOS
+  e-mail forwarding kept its text. The text now goes in pieces of 400 base64 characters, and
+  every write is checked. Texts up to 3000 bytes are relayed in full; a longer one is truncated
+  and marked `[truncated]`. An empty text is never sent: the attempt fails and the SMS stays on
+  the SIM. The bench relays a long Arabic SMS and USSD reply through the real Asterisk console.
+
 ## 0.2.2: firewall fix
 
 The runtime is unchanged (18.15.1-4): the WebUI upgrade reinstalls only `rut360gw`, and the settings

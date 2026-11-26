@@ -162,9 +162,14 @@ See [INSTALL.md](INSTALL.md#rutos-settings-changed-by-the-gateway).
 
 1. `gsmd` stores the SMS on the SIM.
 2. The `rut360gw-sms` daemon lists the SMS every 10 s (`gsmctl -S -l all`). Each new,
-   complete SMS is stored in the Asterisk database: text in base64, sender filtered.
-3. The daemon starts the `sms-to-sip` context. The `msg-to-sip` context sends a `MESSAGE` to
-   `server.extension` on the server, or to the LAN client when no server is enabled.
+   complete SMS is stored in the Asterisk database: text in base64, sender filtered. The
+   Asterisk console ignores a command longer than 512 bytes, so the text goes in pieces of
+   400 base64 characters, 10 at most (3000 bytes of text; a longer text is truncated and
+   marked `[truncated]`). Every write is checked.
+3. The daemon starts the `sms-to-sip` context, which joins the pieces. An empty text is never
+   sent: the attempt fails and the SMS stays on the SIM. The `msg-to-sip` context sends a
+   `MESSAGE` to `server.extension` on the server, or to the LAN client when no server is
+   enabled.
 4. If the `MESSAGE` succeeds, the SMS is recorded in `/etc/rut360gw/sms.seen`. If
    `features.sms_purge=1`, it is deleted from the SIM after `sms_purge_delay` seconds. The
    delay leaves time for RutOS e-mail forwarding.

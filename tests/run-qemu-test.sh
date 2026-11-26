@@ -19,7 +19,7 @@
 # shim ifaddrs_shim.so (LD_PRELOAD, never installed on the router) works around it.
 set -u
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq && apt-get install -y -qq qemu-user-static socat python3 procps >/dev/null 2>&1
+apt-get update -qq && apt-get install -y -qq qemu-user-static socat python3 procps lua5.1 >/dev/null 2>&1
 # binfmt_misc: lets the rootfs' MIPS sh start other MIPS binaries (uci, grep...).
 # Flag F = qemu loaded at registration time, hence usable inside the chroot. Idempotent; stays
 # active in the Docker VM until it restarts (Docker Desktop only registers mips64).
@@ -492,11 +492,58 @@ echo "ring +33612345691" > /ctrl
 for i in $(seq 1 45); do [ "$(q17_count)" -gt "$k0" ] && break; sleep 1; done
 check "register mode: incoming GSM call presented to the server (extension 102, account gw, number in P-Asserted-Identity), \"busy\" rejection relayed" "grep -E 'INVITE ruri=sip:102@127.0.0.1:5070' /res/registrar.log | grep -q 'sip:gw@' && grep 'INVITE ruri=sip:102@' /res/registrar.log | grep -q '+33612345691' && [ \$(q17_count) -gt $k0 ]"
 echo "remote_hangup" > /ctrl; sleep 2
-astrx 'database put rut360sms 9001_b64 Ym9uam91cg==' >/dev/null
+astrx 'database put rut360sms 9001_b0 Ym9uam91cg==' >/dev/null
 astrx 'database put rut360sms 9001_from +33612345692' >/dev/null
 astrx 'channel originate Local/9001@sms-to-sip application Wait 1' >/dev/null
 for i in $(seq 1 15); do grep -q 'MESSAGE-200' /res/registrar.log && break; sleep 1; done
 check "register mode: received SMS relayed as an authenticated MESSAGE (sender as display name, account gw)" "grep -q 'MESSAGE-401' /res/registrar.log && grep 'MESSAGE-200' /res/registrar.log | grep -q -E '[+]33612345692.? <sip:gw@127.0.0.1>' && grep 'MESSAGE-200' /res/registrar.log | grep -q 'body=bonjour'"
+astrx 'database deltree rut360sms' >/dev/null
+# received SMS without text in the AstDB: never sent as an empty MESSAGE, status EMPTY (the
+# SMS then stays on the SIM)
+n0=$(grep -c 'MESSAGE-' /res/registrar.log)
+astrx 'database put rut360sms 9002_from +33612345697' >/dev/null
+astrx 'channel originate Local/9002@sms-to-sip application Wait 1' >/dev/null
+for i in $(seq 1 10); do astrx 'database get rut360sms 9002_status' | grep -q 'Value: EMPTY' && break; sleep 1; done
+sleep 2
+check "received SMS with an empty text: no MESSAGE sent, status EMPTY" "astrx 'database get rut360sms 9002_status' | grep -q 'Value: EMPTY' && [ \$(grep -c 'MESSAGE-' /res/registrar.log) -eq $n0 ]"
+astrx 'database deltree rut360sms' >/dev/null
+# ---- long SMS and USSD reply. The Asterisk console (asterisk -rx) ignores a command over 512
+# bytes, without any error: up to v0.2.2, an SMS of more than about 336 bytes (150 Arabic characters)
+# was relayed with an EMPTY text, then purged from the SIM. rut360gw-sms runs
+# here with the Lua of the container, against the REAL console of the bench Asterisk and a
+# simulated gsmctl (SIM contents in /tmp/bench-sms.list).
+cat > /tmp/bench-cli <<EOF
+#!/bin/sh
+exec chroot $R /usr/bin/qemu-mips-static -E LD_LIBRARY_PATH=$LDP -E LD_PRELOAD=/tmp/tiocexcl_shim.so:/tmp/ifaddrs_shim.so /tmp/rut360gw/root/usr/sbin/asterisk -C /var/run/rut360gw/etc/asterisk.conf -rx "\$*"
+EOF
+cat > /tmp/bench-gsmctl <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+"-S -l") cat /tmp/bench-sms.list 2>/dev/null ;;
+"-S -d") echo OK ;;
+"-S -t") printf 'Used: 1\nTotal: 30\n' ;;
+esac
+EOF
+chmod 755 /tmp/bench-cli /tmp/bench-gsmctl
+/tmp/bench-cli "database put rut360sms 9003_x $(head -c 600 /dev/zero | tr '\0' A)" > /res/cli-long.out 2>&1
+check "Asterisk console: a command over 512 bytes is ignored without any error (hence the text in pieces)" "! grep -q successfully /res/cli-long.out && ! astrx 'database get rut360sms 9003_x' | grep -q 'Value:'"
+# Arabic word "\330\247..." (2 bytes per letter), 40 times: 529 bytes, 570 with the SMS header
+AR=$(printf '\330\247\331\204\330\261\330\265\331\212\330\257 ')
+LONG="DEBUT $(for i in $(seq 1 40); do printf '%s' "$AR"; done)FIN"
+SMSENV="RUT360GW_CLI=/tmp/bench-cli RUT360GW_GSMCTL=/tmp/bench-gsmctl RUT360GW_SMS_SEEN=/tmp/bench-sms.seen"
+: > /tmp/bench-sms.list; rm -f /tmp/bench-sms.seen
+env $SMSENV lua5.1 /repo/package/rut360gw/files/usr/sbin/rut360gw-sms daemon > /res/sms-daemon.out 2>&1 &
+SMSD=$!
+sleep 3
+printf 'Index:\t\t0\nDate:\t\tThu Nov 26 10:19:34 2026\nSender:\t\t505\nStatus:\t\tunread\nMissing:\t0\nText:\t\t%s\n\n' "$LONG" > /tmp/bench-sms.list
+for i in $(seq 1 40); do grep -q -F "$LONG" /res/registrar.log && break; sleep 1; done
+sleep 2; kill $SMSD 2>/dev/null
+check "long SMS in Arabic (570 bytes, 2 pieces): relayed in full by the daemon, then marked as relayed" "grep -q 'MESSAGE-200 .*body=SMS from 505 (Thu Nov 26 10:19:34 2026):' /res/registrar.log && grep -q -x -F \"\$LONG\" /res/registrar.log && grep -q '+$' /tmp/bench-sms.seen"
+printf '0|%s' "$LONG" > /tmp/bench-ussd.dryrun
+env $SMSENV RUT360GW_USSD_DRYRUN=/tmp/bench-ussd.dryrun RUT360GW_USSD_HIST=/tmp/bench-ussd.hist lua5.1 /repo/package/rut360gw/files/usr/sbin/rut360gw-sms ussd '*505#' > /res/ussd-long.out 2>&1
+check "long USSD reply in Arabic: relayed in full" "grep -q 'MESSAGE-200 .*body=USSD [*]505#:' /res/registrar.log && [ \$(grep -c -x -F \"\$LONG\" /res/registrar.log) -ge 2 ]"
+check "AstDB left clean after the relays" "! astrx 'database show rut360sms' | grep -q -E '_(b[0-9]|from|status) '"
+astrx 'database deltree rut360sms' >/dev/null
 echo "invite 0612345693" > /ctrl-reg
 dial_wait 0612345693
 check "register mode: call from the server (registered line) dialed to GSM" "grep -q 'ATD0612345693' /res/at.log"

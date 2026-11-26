@@ -47,8 +47,19 @@ local GSMCTL = os.getenv("RUT360GW_GSMCTL") or "gsmctl"
 -- RutOS 7.14 installs packages under /usr/local (read-only root); / for the generic test bench
 local PFX = ""
 do local f = io.open("/usr/local/usr/sbin/rut360gw-cli", "r"); if f then f:close(); PFX = "/usr/local" end end
-local AST = PFX .. "/usr/sbin/rut360gw-cli "
+local AST = (os.getenv("RUT360GW_CLI") or (PFX .. "/usr/sbin/rut360gw-cli")) .. " "
 local POLL_S, STATUS_WAIT_S, MAX_TRIES, SEEN_MAX = 10, 15, 5, 500
+-- The Asterisk console (asterisk -rx, behind rut360gw-cli) reads a command in a 512-byte buffer,
+-- "cli quit after " prefix and final NUL included: a longer command is cut, then ignored without
+-- any error. Up to v0.2.2 the whole text went in one command: an SMS of more than about 336 bytes
+-- (about 290 Latin characters, or 150 Arabic ones) was relayed with an EMPTY text, counted as relayed, then
+-- purged from the SIM. Every command built here stays under CLI_MAX bytes; the text goes into the
+-- AstDB in at most TEXT_PIECES pieces of PIECE base64 characters (keys <id>_b0 to <id>_b9, joined
+-- by the [sms-to-sip] context), hence at most TEXT_MAX bytes of text (the dialplan handles at most
+-- 4095 characters in one expansion).
+local CLI_MAX, PIECE, TEXT_PIECES = 496, 400, 10
+local TEXT_MAX = PIECE * TEXT_PIECES / 4 * 3
+local CUT_MARK = "\n[truncated]"
 
 -- ---------------------------------------------------------------- utilities
 local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -230,21 +241,56 @@ local function purge_candidates(msgs, relayed, relayed_at, now, delay)
 	return out
 end
 
+-- First n bytes of a UTF-8 string at most, without cutting a character.
+local function utf8_cut(s, n)
+	if #s <= n then return s end
+	while n > 0 and s:byte(n + 1) >= 0x80 and s:byte(n + 1) < 0xC0 do n = n - 1 end
+	return s:sub(1, n)
+end
+
+-- Text -> base64 pieces for the AstDB (see CLI_MAX); a text longer than TEXT_MAX is truncated.
+local function text_pieces(body)
+	if #body > TEXT_MAX then body = utf8_cut(body, TEXT_MAX - #CUT_MARK) .. CUT_MARK end
+	local b, out = b64enc(body), {}
+	for i = 1, #b, PIECE do out[#out + 1] = b:sub(i, i + PIECE - 1) end
+	return out, body
+end
+
+-- Asterisk console command; false if it is too long for the console (it would be ignored)
+local function ast_cmd(c)
+	if #c > CLI_MAX then return false end
+	return run(AST .. shquote(c))
+end
+
 -- Sends a text as a SIP MESSAGE (remote server, otherwise LAN client) through the [sms-to-sip] context.
+-- The "successfully" answer of every AstDB write is checked: a text that did not reach Asterisk is
+-- never sent (the SMS stays on the SIM, and is tried again).
 local function forward_text(body, sender, tag)
 	local id = tostring(os.time()) .. "x" .. (tag or fnv1a(body))
-	sender = (sender or "unknown"):gsub("[^%w%+]", "")
+	sender = (sender or "unknown"):gsub("[^%w%+]", ""):sub(1, 32)
 	if sender == "" then sender = "unknown" end
-	run(AST .. shquote("database put rut360sms " .. id .. "_b64 " .. b64enc(body)))
-	run(AST .. shquote("database put rut360sms " .. id .. "_from " .. sender))
-	run(AST .. shquote("channel originate Local/" .. id .. "@sms-to-sip application Wait 1"))
-	local status = ""
-	for _ = 1, STATUS_WAIT_S do
-		os.execute("sleep 1")
-		status = run(AST .. shquote("database get rut360sms " .. id .. "_status")):match("Value:%s*(%S+)") or ""
-		if status ~= "" then break end
+	local pieces, sent = text_pieces(body)
+	if #sent < #body then log(string.format("text of %d bytes truncated to %d bytes", #body, #sent)) end
+	local keys, stored = { id .. "_from" }, (ast_cmd("database put rut360sms " .. id .. "_from " .. sender) or ""):match("successfully")
+	for i, p in ipairs(pieces) do
+		if not stored then break end
+		local k = id .. "_b" .. (i - 1)
+		keys[#keys + 1] = k
+		stored = (ast_cmd("database put rut360sms " .. k .. " " .. p) or ""):match("successfully")
 	end
-	for _, k in ipairs({ "_b64", "_from", "_status" }) do run(AST .. shquote("database del rut360sms " .. id .. k)) end
+	local status = ""
+	if stored then
+		ast_cmd("channel originate Local/" .. id .. "@sms-to-sip application Wait 1")
+		for _ = 1, STATUS_WAIT_S do
+			os.execute("sleep 1")
+			status = (ast_cmd("database get rut360sms " .. id .. "_status") or ""):match("Value:%s*(%S+)") or ""
+			if status ~= "" then keys[#keys + 1] = id .. "_status"; break end
+		end
+	else
+		status = "NOT-STORED"
+		log("text not handed to Asterisk (AstDB write refused): not sent")
+	end
+	for _, k in ipairs(keys) do ast_cmd("database del rut360sms " .. k) end
 	return status == "SUCCESS", status
 end
 
@@ -536,6 +582,29 @@ local function cmd_selftest()
 		check("base64 round trip (" .. #s .. " bytes)", b64dec(b64enc(s)) == s)
 	end
 	check("base64 compliant with RFC 4648", b64enc("\195\169\226\130\172\240\159\152\128") == "w6nigqzwn5iA")
+	-- long text (Asterisk console limit): "\216\167\217\132\216\177\216\181\217\138\216\175" = an
+	-- Arabic word (2 bytes per letter); 366 bytes = the SMS relayed empty up to v0.2.2
+	local ar = "\216\167\217\132\216\177\216\181\217\138\216\175 "
+	local id = "1794409860x0a1b2c3d"
+	local function fits(pieces)
+		for i, p in ipairs(pieces) do
+			if #("database put rut360sms " .. id .. "_b" .. (i - 1) .. " " .. p) > CLI_MAX then return false end
+		end
+		return #pieces <= TEXT_PIECES
+	end
+	for _, n in ipairs({ 1, 28, 200, 227 }) do
+		local s = "SMS from 505 (Thu Nov 26 10:19:34 2026):\n" .. string.rep(ar, n)
+		local p, sent = text_pieces(s)
+		check("long text (" .. #s .. " bytes): " .. #p .. " piece(s) under the console limit, unchanged", fits(p) and sent == s and b64dec(table.concat(p)) == s)
+	end
+	local big = string.rep(ar, 500)
+	local p, sent = text_pieces(big)
+	local kept = sent:sub(1, #sent - #CUT_MARK)
+	check("text over " .. TEXT_MAX .. " bytes: truncated and marked, under the console limit", #sent <= TEXT_MAX
+		and sent:sub(-#CUT_MARK) == CUT_MARK and big:sub(1, #kept) == kept and fits(p) and b64dec(table.concat(p)) == sent)
+	check("truncation on a character boundary", utf8_cut("\216\167\216\167", 3) == "\216\167" and utf8_cut("ab", 5) == "ab"
+		and utf8_cut("a\240\159\152\128", 4) == "a" and utf8_cut("a\240\159\152\128", 5) == "a\240\159\152\128")
+	check("console command too long: refused, never sent", ast_cmd(string.rep("x", CLI_MAX + 1)) == false)
 	check("shquote neutralises the apostrophe", shquote("a'b; rm -rf /") == [['a'\''b; rm -rf /']])
 	check("number +33... accepted", valid_number("+33612345678"))
 	check("number with ; refused", not valid_number("0612;reboot"))
